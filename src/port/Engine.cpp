@@ -13,6 +13,7 @@
 #include "port/os/OS.h"
 #include "port/DevTools/ThreadWatchdog.h"
 #include "port/TextureCache.h"
+#include "vr/Vr.h"
 #include "src/Companion.h"
 #include "ui/PaperboatGui.hpp"
 #include "ui/PaperboatModMenuWindow.h"
@@ -27,6 +28,7 @@
 #include <BS_thread_pool.hpp>
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdarg>
 #include <fast/Fast3dWindow.h>
@@ -1015,6 +1017,12 @@ void GameEngine::StartFrame() const {
 }
 
 uint32_t GameEngine::GetInterpolationFPS() {
+    // In VR, pace interpolation to the headset refresh so sub-frames land on the
+    // frames the runtime presents (otherwise the game judders on a 90 Hz HMD).
+    if (uint32_t vrFps = Paperboat::VR::GetTargetFpsOverride(); vrFps > 0) {
+        return vrFps;
+    }
+
     if (CVarGetInteger(CVAR_SETTING("MatchRefreshRate"), 0)) {
         return Ship::Context::GetRawInstance()->GetWindow()->GetCurrentRefreshRate();
     }
@@ -1087,10 +1095,44 @@ void GameEngine::RunCommands(Gfx* Commands, const std::vector<std::unordered_map
 
     interpreter->mInterpolationIndex = 0;
 
+    // Initialise the OpenXR session the first time we render (the window and
+    // interpreter are ready by now). No-op when there is no runtime/HMD.
+    static bool vrInitAttempted = false;
+    if (!vrInitAttempted) {
+        vrInitAttempted = true;
+        Paperboat::VR::Initialize();
+    }
+
+    // Cap the render resolution when VR is active so a large desktop window
+    // doesn't make each eye render at, e.g., 2560x1299 (frame drops / judder).
+    Paperboat::VR::UpdateResolutionCap(interpreter);
+
+    // --- temporary VR tick/subframe diagnostic ---
+    if (Paperboat::VR::GetEnabled()) {
+        static auto s_last = std::chrono::steady_clock::now();
+        static int s_ticks = 0, s_subs = 0;
+        ++s_ticks;
+        s_subs += (int)mtx_replacements.size();
+        const auto now = std::chrono::steady_clock::now();
+        const double dt = std::chrono::duration<double>(now - s_last).count();
+        if (dt >= 2.0) {
+            SPDLOG_INFO("[VR] ticks/s={:.1f} subs/tick={:.2f}", s_ticks / dt, (double)s_subs / s_ticks);
+            s_last = now;
+            s_ticks = 0;
+            s_subs = 0;
+        }
+    }
+
     for (size_t i = 0; i < mtx_replacements.size(); i++) {
         // The game has queued its next frame, so we're behind: skip to this frame's last draw
         // rather than leaving the game to skip drawing a whole frame.
         if (i + 1 < mtx_replacements.size() && nuGfxTaskSpool >= 2) {
+            interpreter->mInterpolationIndex++;
+            continue;
+        }
+
+        if (Paperboat::VR::GetEnabled() && Paperboat::VR::RenderGameFrame(Commands, mtx_replacements[i])) {
+            OS_ViNotifyPresent();
             interpreter->mInterpolationIndex++;
             continue;
         }
@@ -1112,6 +1154,13 @@ void GameEngine::ProcessGfxCommands(Gfx* commands) {
     std::vector<std::unordered_map<Mtx*, MtxF>> mtx_replacements;
 
     int target_fps = GetInterpolationFPS();
+    {
+        static int s_logged = -1;
+        if (target_fps != s_logged) {
+            s_logged = target_fps;
+            SPDLOG_INFO("[VR] interp target_fps={} override={}", target_fps, Paperboat::VR::GetTargetFpsOverride());
+        }
+    }
     static int last_fps;
     static int time;
     int fps = target_fps;

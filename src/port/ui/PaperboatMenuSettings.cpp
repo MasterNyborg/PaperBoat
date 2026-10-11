@@ -7,6 +7,7 @@
 #include "port/Engine.h"
 #include "port/TextureCache.h"
 #include "port/save/SaveConverter.h"
+#include "vr/Vr.h"
 #include <spdlog/fmt/fmt.h>
 
 namespace PaperboatGui {
@@ -494,6 +495,69 @@ void PaperboatMenu::AddMenuSettings() {
         .WindowName("Input Viewer Settings")
         .HideInSearch(true)
         .Options(WindowButtonOptions().Tooltip("Enables the separate Input Viewer Settings Window."));
+
+    // Settings > VR
+    path.sidebarName = "VR";
+    path.column = SECTION_COLUMN_1;
+    AddSidebarEntry("Settings", "VR", 1);
+    AddWidget(path, "VR Options", WIDGET_SEPARATOR_TEXT);
+    static bool vrEnabled = Paperboat::VR::GetEnabled();
+    static float vrScreenSize = Paperboat::VR::GetScreenSize();
+    static float vrScreenDistance = Paperboat::VR::GetScreenDistance();
+    static float vrStereo = Paperboat::VR::GetStereoStrength();
+    AddWidget(path, "Enable VR", WIDGET_CHECKBOX)
+        .ValuePointer(&vrEnabled)
+        .RaceDisable(false)
+        .Callback([](WidgetInfo&) { Paperboat::VR::SetEnabled(vrEnabled); })
+        .Options(
+            CheckboxOptions().Tooltip(
+                "Renders the game to a world-locked stereoscopic screen in the headset. "
+                "Requires an OpenXR runtime and a DirectX 11 build."
+            )
+        );
+    AddWidget(path, "Recenter Screen", WIDGET_BUTTON)
+        .RaceDisable(false)
+        .Callback([](WidgetInfo&) { Paperboat::VR::Recenter(); })
+        .Options(ButtonOptions().Tooltip("Places the virtual screen in front of where you are looking."));
+    AddWidget(path, "Screen Size (m)", WIDGET_SLIDER_FLOAT)
+        .ValuePointer(&vrScreenSize)
+        .RaceDisable(false)
+        .Callback([](WidgetInfo&) { Paperboat::VR::SetScreenSize(vrScreenSize); })
+        .Options(
+            FloatSliderOptions()
+                .Tooltip("Width of the virtual screen, in metres.")
+                .Format("%.2f")
+                .Step(0.1f)
+                .Min(0.25f)
+                .Max(12.0f)
+                .DefaultValue(1.6f)
+        );
+    AddWidget(path, "Screen Distance (m)", WIDGET_SLIDER_FLOAT)
+        .ValuePointer(&vrScreenDistance)
+        .RaceDisable(false)
+        .Callback([](WidgetInfo&) { Paperboat::VR::SetScreenDistance(vrScreenDistance); })
+        .Options(
+            FloatSliderOptions()
+                .Tooltip("How far in front of your eyes the screen sits, in metres.")
+                .Format("%.2f")
+                .Step(0.1f)
+                .Min(0.5f)
+                .Max(15.0f)
+                .DefaultValue(2.0f)
+        );
+    AddWidget(path, "3D Strength", WIDGET_SLIDER_FLOAT)
+        .ValuePointer(&vrStereo)
+        .RaceDisable(false)
+        .Callback([](WidgetInfo&) { Paperboat::VR::SetStereoStrength(vrStereo); })
+        .Options(
+            FloatSliderOptions()
+                .Tooltip("Eye separation; controls how deep the 3D looks. 0 = flat (mono).")
+                .Format("%.2f")
+                .Step(0.25f)
+                .Min(0.0f)
+                .Max(20.0f)
+                .DefaultValue(2.0f)
+        );
 
     // Notifications
     path.sidebarName = "Notifications";

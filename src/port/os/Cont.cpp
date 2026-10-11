@@ -4,10 +4,12 @@
 
 #include "OS.h"
 #include "port/ui/TouchControls.h"
+#include "vr/Vr.h"
 
 #include <libultraship/libultraship.h>
 
 #include <atomic>
+#include <cstdint>
 #include <cstring>
 #include <mutex>
 
@@ -64,6 +66,20 @@ extern "C" int OS_SiService(void) {
         Ship::Context::GetRawInstance()->GetControlDeck()->WriteToPad(sLatch);
         // Merges the on-screen controls into port 0; no-op unless enabled.
         TouchControls_ApplyPad(sLatch);
+
+        // Merge VR-controller input into port 0. Buttons OR together; the analog
+        // stick only overrides when the VR stick is actually deflected, so
+        // keyboard/gamepad still steer when the stick is centred.
+        uint16_t vrButtons = 0;
+        int8_t vrStickX = 0;
+        int8_t vrStickY = 0;
+        if (Paperboat::VR::GetVrPad(vrButtons, vrStickX, vrStickY)) {
+            sLatch[0].button |= vrButtons;
+            if (vrStickX != 0 || vrStickY != 0) {
+                sLatch[0].stick_x = vrStickX;
+                sLatch[0].stick_y = vrStickY;
+            }
+        }
     }
     sLatchValid.store(true, std::memory_order_release);
     OS_SendEventMesg(OS_EVENT_SI);

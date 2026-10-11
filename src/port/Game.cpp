@@ -10,6 +10,7 @@
 #include "port/DevTools/ThreadWatchdog.h"
 #include "port/interpolation/FrameInterpolation.h"
 #include "port/os/OS.h"
+#include "vr/Vr.h"
 
 #ifdef __EMSCRIPTEN__
 #include <SDL2/SDL.h>
@@ -132,6 +133,9 @@ extern "C"
     Graphics_EnableNusysThreads();
     GameEngine::Create(argc, argv);
 
+    // Start OpenXR at launch (window/device now exist). No-op without a runtime.
+    Paperboat::VR::Initialize();
+
     auto wnd = std::dynamic_pointer_cast<Fast::Fast3dWindow>(Ship::Context::GetRawInstance()->GetWindow());
 
     // Initialize game systems
@@ -142,6 +146,7 @@ extern "C"
 
     while (wnd->IsRunning()) {
         ThreadWatchdog_Beat(WATCHDOG_MAIN_LOOP);
+        Paperboat::VR::PollHotkeys();
         GameEngine::Instance->StartFrame();
         OS_SiService();
         GameEngine::DrainRenderService();
@@ -151,7 +156,13 @@ extern "C"
                 SDL_Delay(16);
                 continue;
             }
-            SDL_Delay(1);
+            // No graphics task this iteration: keep the headset alive by
+            // re-submitting the last rendered image.
+            if (Paperboat::VR::IsSessionRunning()) {
+                Paperboat::VR::RenderIdleFrame();
+            } else {
+                SDL_Delay(1);
+            }
         }
 #ifdef __EMSCRIPTEN__
         // A tab can close without warning, so sync periodically, not just on exit.
@@ -168,6 +179,9 @@ extern "C"
     GameEngine::ShutdownRenderService();
     OS_BeginShutdown();
     OS_StopViTicker();
+
+    // Shut VR down before the D3D device/window is destroyed.
+    Paperboat::VR::Shutdown();
 
     GameEngine::Instance->Destroy();
     GameEngine::RelaunchIfRequested(argc, argv);

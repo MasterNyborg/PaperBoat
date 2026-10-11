@@ -139,6 +139,37 @@ endif()
 include(FetchContent)
 
 ################################################################################
+# OpenXR (Windows VR support)
+#
+# Self-contained: fetches the Khronos OpenXR-SDK-Source and builds the loader
+# from source. We build only the loader (no API layers/tests/samples). The
+# loader is linked into Paperboat and its DLL is copied next to the exe.
+#
+# The options must be set BEFORE FetchContent_MakeAvailable so the vendored
+# project picks them up (its own defaults build tests/samples).
+################################################################################
+if(WIN32)
+    set(BUILD_LOADER ON CACHE BOOL "" FORCE)
+    set(BUILD_API_LAYERS OFF CACHE BOOL "" FORCE)
+    set(BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(BUILD_CONFORMANCE_TESTS OFF CACHE BOOL "" FORCE)
+    set(BUILD_SDK_TESTS OFF CACHE BOOL "" FORCE)
+    set(BUILD_FORCE_GENERATION OFF CACHE BOOL "" FORCE)
+    set(BUILD_WITH_SYSTEM_JSONCPP OFF CACHE BOOL "" FORCE)
+    # A DLL keeps the loader's CRT self-contained; matches Paperboat's static CRT.
+    set(DYNAMIC_LOADER ON CACHE BOOL "" FORCE)
+    set(OPENXR_DEBUG_POSTFIX "" CACHE STRING "" FORCE)
+
+    FetchContent_Declare(
+        openxr_sdk
+        GIT_REPOSITORY https://github.com/KhronosGroup/OpenXR-SDK-Source.git
+        GIT_TAG release-1.1.42
+        GIT_SHALLOW TRUE
+    )
+    FetchContent_MakeAvailable(openxr_sdk)
+endif()
+
+################################################################################
 # libultraship dependencies the platform files don't cover
 #
 # libultraship has no cmake/dependencies/emscripten.cmake, so its
@@ -477,6 +508,28 @@ add_custom_target(GeneratePortO2R DEPENDS "${PAPERBOAT_PORT_O2R}")
 add_dependencies(${PROJECT_NAME} GeneratePortO2R)
 
 target_link_libraries(${PROJECT_NAME} PRIVATE libultraship torch yaml-cpp)
+
+################################################################################
+# OpenXR wiring (Windows)
+#
+# XR_USE_PLATFORM_WIN32 / XR_USE_GRAPHICS_API_D3D11 must be defined wherever
+# <openxr/openxr_platform.h> is included; they pull in the D3D11 platform types.
+# Only src/port/vr includes that header, so a target-wide define is harmless.
+################################################################################
+if(WIN32 AND TARGET OpenXR::openxr_loader)
+    target_link_libraries(${PROJECT_NAME} PRIVATE OpenXR::openxr_loader advapi32)
+    target_compile_definitions(${PROJECT_NAME} PRIVATE
+        XR_USE_PLATFORM_WIN32
+        XR_USE_GRAPHICS_API_D3D11
+        PAPERBOAT_ENABLE_OPENXR=1
+    )
+    add_custom_command(TARGET ${PROJECT_NAME} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "$<TARGET_FILE:OpenXR::openxr_loader>"
+                "$<TARGET_FILE_DIR:${PROJECT_NAME}>"
+        COMMENT "Copying OpenXR loader DLL next to Paperboat"
+    )
+endif()
 
 if(ANDROID)
     # libzip comes from libultraship's android.cmake, so its headers are in the

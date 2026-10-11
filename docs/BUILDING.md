@@ -49,6 +49,21 @@ cmake --preset windows-debug
 cmake --build --preset windows-debug -j
 ```
 
+#### Windows quick loop (wrapper scripts)
+
+`port-build.ps1` and `port-run.ps1` in the repo root wrap the Windows build so
+you don't have to open a Developer PowerShell by hand. `port-build.ps1` enters
+the VS developer shell for you and clears the `VCPKG_ROOT` shim that the dev
+shell otherwise points at `VC\vcpkg` (which has no ports and breaks the vcpkg
+bootstrap). Subsequent builds are incremental.
+
+```powershell
+.\port-build.ps1                 # configure (first run) + build Debug
+.\port-build.ps1 -Config Release # Release build
+.\port-run.ps1                   # launch build\windows-debug\Paperboat.exe
+.\port-run.ps1 -Rom <rom.z64>    # launch straight into ROM import
+```
+
 #### macOS / Linux
 
 ```
@@ -80,3 +95,37 @@ direct edits to decomp files, so the supported Windows path is
 | Ctrl+R | Reset (inside levels) |
 | F11 | Fullscreen |
 | Tab | Toggle Alternate assets |
+
+# VR (OpenXR)
+
+PaperBoat can render the game as a **world-locked, stereoscopic screen** inside a
+headset (a "3D TV"), while the desktop window mirrors the left eye. It is not a
+full VR conversion: the game camera, input and gameplay are unchanged — only the
+image is shown on a virtual screen you can resize and move.
+
+Requirements:
+
+- Windows with the **DirectX 11** renderer (Settings → Renderer API).
+- An **OpenXR runtime** (SteamVR, Oculus, Virtual Desktop/VDXR, …). The active
+  runtime is whatever is registered under
+  `HKLM\SOFTWARE\Khronos\OpenXR\1\ActiveRuntime`.
+- A supported Paper Mario (US) ROM, imported as usual.
+
+The OpenXR loader is fetched and built automatically (Khronos OpenXR-SDK, pinned
+in `CMakeLists.txt`); `openxr_loader.dll` is copied next to `Paperboat.exe`.
+
+## Controls
+
+Adjustable at runtime with the keyboard (works while wearing the headset, since
+the game window keeps focus) and from **Settings → VR** in the menu.
+
+| Keys | Action |
+| - | - |
+| Ctrl+Alt+V | Toggle VR rendering on/off |
+| Ctrl+Alt+R | Recenter the screen in front of you |
+| Ctrl+Alt+Up / Down | Move the screen closer / farther |
+| Ctrl+Alt+Left / Right | Shrink / grow the screen |
+| Ctrl+Alt+, / . | Decrease / increase 3D strength (0 = flat) |
+
+If no headset/runtime is present, VR silently stays off and the game runs
+normally. See `src/port/vr/README.md` for implementation notes.
