@@ -150,19 +150,20 @@ extern "C"
         GameEngine::Instance->StartFrame();
         OS_SiService();
         GameEngine::DrainRenderService();
-        if (!ServiceRcp()) {
-            if (ThreadWatchdog_IsStalled(WATCHDOG_GAME_TICK)) {
-                GameEngine::Instance->RenderGuiFrame();
-                SDL_Delay(16);
-                continue;
-            }
-            // No graphics task this iteration: keep the headset alive by
-            // re-submitting the last rendered image.
-            if (Paperboat::VR::IsSessionRunning()) {
-                Paperboat::VR::RenderIdleFrame();
-            } else {
-                SDL_Delay(1);
-            }
+        const bool hadTask = ServiceRcp() != 0;
+
+        if (!hadTask && ThreadWatchdog_IsStalled(WATCHDOG_GAME_TICK)) {
+            GameEngine::Instance->RenderGuiFrame();
+            SDL_Delay(16);
+        }
+
+        // Deliver one frame to the headset every iteration (display-rate,
+        // in-order delivery), reusing the latest game render if there was no
+        // new task this iteration.
+        if (Paperboat::VR::IsSessionRunning()) {
+            Paperboat::VR::PresentFrame();
+        } else if (!hadTask) {
+            SDL_Delay(1);
         }
 #ifdef __EMSCRIPTEN__
         // A tab can close without warning, so sync periodically, not just on exit.

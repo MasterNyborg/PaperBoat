@@ -61,6 +61,11 @@ bool RenderGameFrame(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtxRep
 // where the game produced no new display list (loading screens, stalls).
 void RenderIdleFrame();
 
+// Submits one frame to the headset at the display rate, reusing the most recent
+// game render. Call once per main-loop iteration so the headset always receives
+// a frame every display tick, in order, regardless of the game's render rate.
+void PresentFrame();
+
 // Keyboard shortcuts (recenter / size / distance / stereo / toggle). Call once
 // per main-loop iteration.
 void PollHotkeys();

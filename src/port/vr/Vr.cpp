@@ -290,10 +290,15 @@ class Context {
     float renderAspect = 0.0f; // captured once from the game camera viewport
     EyeSwapchain eyes[2];
     Blitter blitter;
+    // The game renders into these at its own rate; the presentation step copies
+    // them into the XR swapchains at the headset rate (decoupled frame delivery).
+    ComPtr<ID3D11Texture2D> eyeTex[2];
+    ComPtr<ID3D11ShaderResourceView> eyeSrv[2];
     XrPosef screenPose{ { 0, 0, 0, 1 }, { 0, 0, -kDefaultScreenDistance } };
     XrExtent2Df screenSize{ kDefaultScreenSize, kDefaultScreenSize * 0.75f };
 
     bool CreateSwapchains(uint32_t width, uint32_t height);
+    void CreateEyeTextures(uint32_t width, uint32_t height);
     ID3D11DeviceContext* DeviceContext() const {
         return context;
     }
@@ -786,8 +791,34 @@ bool Context::CreateSwapchains(uint32_t width, uint32_t height) {
 
     renderWidth = width;
     renderHeight = height;
+    CreateEyeTextures(width, height);
     SPDLOG_INFO("[VR] Swapchains created {}x{} (format {}).", width, height, chosenFormat);
     return true;
+}
+
+// Intermediate eye targets the game renders into. The presentation step copies
+// these into the XR swapchains, decoupling the game's render rate from the
+// headset's frame rate.
+void Context::CreateEyeTextures(uint32_t width, uint32_t height) {
+    for (int e = 0; e < 2; ++e) {
+        eyeSrv[e].Reset();
+        eyeTex[e].Reset();
+        if (!device) {
+            continue;
+        }
+        D3D11_TEXTURE2D_DESC desc{};
+        desc.Width = width;
+        desc.Height = height;
+        desc.MipLevels = 1;
+        desc.ArraySize = 1;
+        desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM; // matches the game framebuffer
+        desc.SampleDesc.Count = 1;
+        desc.Usage = D3D11_USAGE_DEFAULT;
+        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        if (SUCCEEDED(device->CreateTexture2D(&desc, nullptr, eyeTex[e].GetAddressOf()))) {
+            device->CreateShaderResourceView(eyeTex[e].Get(), nullptr, eyeSrv[e].GetAddressOf());
+        }
+    }
 }
 
 void Context::DestroySwapchains() {
@@ -1054,52 +1085,46 @@ DXGI_FORMAT UnormViewFormat(int64_t fmt) {
     }
 }
 
-// Copies the current game frame buffer (interpreter->mGfxFrameBuffer, an
-// ID3D11ShaderResourceView) into the eye's acquired swapchain image.
-void CopyTextureToEye(Fast::Interpreter* interp, Context* c, int eye) {
+// Copies the game's current framebuffer into this eye's intermediate texture.
+void CopyGameFbToEyeTex(Fast::Interpreter* interp, Context* c, int eye) {
     uintptr_t fb = interp->mGfxFrameBuffer;
-    if (fb == 0) {
+    if (fb == 0 || !c->eyeTex[eye]) {
         return;
     }
     auto* srv = reinterpret_cast<ID3D11ShaderResourceView*>(fb);
+    ComPtr<ID3D11Resource> res;
+    srv->GetResource(res.GetAddressOf());
+    ComPtr<ID3D11Texture2D> src;
+    if (res) {
+        res.As(&src);
+    }
+    if (!src) {
+        return;
+    }
+    D3D11_TEXTURE2D_DESC sd{}, dd{};
+    src->GetDesc(&sd);
+    c->eyeTex[eye]->GetDesc(&dd);
+    ID3D11DeviceContext* ctx = c->DeviceContext();
+    if (sd.Width == dd.Width && sd.Height == dd.Height && sd.Format == dd.Format) {
+        ctx->CopyResource(c->eyeTex[eye].Get(), src.Get());
+    } else if (c->blitter.ready) {
+        c->blitter.Blit(c->Device(), ctx, srv, c->eyeTex[eye].Get(), DXGI_FORMAT_R8G8B8A8_UNORM, c->renderWidth,
+                        c->renderHeight);
+    }
+}
+
+// Copies an eye's intermediate texture into its acquired XR swapchain image.
+void BlitEyeTexToSwapchain(Context* c, int eye) {
     EyeSwapchain& sc = c->eyes[eye];
-    if (!sc.acquired) {
+    if (!sc.acquired || !c->eyeSrv[eye] || !c->blitter.ready) {
         return;
     }
     ID3D11Texture2D* dst = sc.images[sc.acquiredIndex].texture;
     if (!dst) {
         return;
     }
-    ID3D11DeviceContext* ctx = c->DeviceContext();
-
-    if (c->blitter.ready) {
-        c->blitter.Blit(c->Device(), ctx, srv, dst, UnormViewFormat(sc.format), sc.width, sc.height);
-        return;
-    }
-
-    // Fallback when d3dcompiler is unavailable: raw copy if formats/sizes match.
-    ComPtr<ID3D11Resource> res;
-    srv->GetResource(res.GetAddressOf());
-    ComPtr<ID3D11Texture2D> srcTex;
-    if (res) {
-        res.As(&srcTex);
-    }
-    if (!srcTex) {
-        return;
-    }
-    D3D11_TEXTURE2D_DESC sd{}, dd{};
-    srcTex->GetDesc(&sd);
-    dst->GetDesc(&dd);
-    if (sd.Width == dd.Width && sd.Height == dd.Height && sd.Format == dd.Format) {
-        ctx->CopyResource(dst, srcTex.Get());
-    } else {
-        static bool warned = false;
-        if (!warned) {
-            SPDLOG_WARN("[VR] No blitter and formats differ (game fmt{} vs swapchain fmt{}); skipping.", (int)sd.Format,
-                        (int)dd.Format);
-            warned = true;
-        }
-    }
+    c->blitter.Blit(c->Device(), c->DeviceContext(), c->eyeSrv[eye].Get(), dst, UnormViewFormat(sc.format), sc.width,
+                    sc.height);
 }
 
 // Converts a packed N64 fixed-point matrix to floats, using the exact layout the
@@ -1179,9 +1204,10 @@ void ApplyEyeOffset(std::unordered_map<Mtx*, MtxF>& map, float worldOffset) {
     }
 }
 
-// Renders one eye into mGameFb (reused) and copies it to the eye swapchain.
-void RenderEyeToSwapchain(Fast::Interpreter* interp, Context* c, int eye, Gfx* commands,
-                          const std::unordered_map<Mtx*, MtxF>& baseMap, float eyeOffset) {
+// Renders one eye into mGameFb (reused) and copies it to this eye's intermediate
+// texture. The presentation step later copies that into the headset swapchain.
+void RenderEyeToTex(Fast::Interpreter* interp, Context* c, int eye, Gfx* commands,
+                    const std::unordered_map<Mtx*, MtxF>& baseMap, float eyeOffset) {
     std::unordered_map<Mtx*, MtxF> map = baseMap;
     ApplyEyeOffset(map, eyeOffset);
 
@@ -1193,7 +1219,7 @@ void RenderEyeToSwapchain(Fast::Interpreter* interp, Context* c, int eye, Gfx* c
 
     interp->Run(commands, map, {});
 
-    CopyTextureToEye(interp, c, eye);
+    CopyGameFbToEyeTex(interp, c, eye);
 }
 
 // Makes the next Run() render offscreen into mGameFb at the interpreter's
@@ -1257,6 +1283,12 @@ bool VrDebugEnabled() {
 int EnvInt(const char* name) {
     const char* v = std::getenv(name);
     return v != nullptr ? std::atoi(v) : 0;
+}
+
+// Optional float env override (0 == unset).
+float EnvFloat(const char* name) {
+    const char* v = std::getenv(name);
+    return v != nullptr ? (float)std::atof(v) : 0.0f;
 }
 
 // Places the screen in front of the head. Returns false if the head pose is not
@@ -1349,29 +1381,17 @@ bool GetVrPad(uint16_t& buttons, int8_t& stickX, int8_t& stickY) {
 }
 
 uint32_t GetTargetFpsOverride() {
-    // The port's interpolation is integer-sub-frame based (it produces
-    // target/30 sub-frames per 30 Hz tick). We pick a rate that EVENLY divides
-    // the headset refresh: a rate that doesn't (e.g. 90 on a 120 Hz panel) makes
-    // the runtime show frames for an uneven number of refreshes, which reads as
-    // jitter even though the frame rate is high. Capped at 60 so we can sustain
-    // the stereo render. PAPERBOAT_VR_FPS forces a value for tuning.
+    // This is the GAME's render rate, not the headset's: the headset is updated
+    // every display tick by PresentFrame() regardless (60 fps game content on a
+    // 120 Hz headset, each game frame delivered twice, evenly). 60 gives two
+    // sub-frames per 30 Hz game tick. PAPERBOAT_VR_FPS forces a value.
     if (!g_enabled || g_ctx == nullptr || !g_ctx->sessionRunning) {
         return 0;
     }
     if (int forced = EnvInt("PAPERBOAT_VR_FPS"); forced > 0) {
         return (uint32_t)forced;
     }
-    const uint32_t hmd = g_ctx->targetFps;
-    if (hmd < 30) {
-        return 0;
-    }
-    uint32_t best = 30;
-    for (uint32_t n = 30; n <= hmd && n <= 60; n += 30) {
-        if (hmd % n == 0) {
-            best = n;
-        }
-    }
-    return best;
+    return 60;
 }
 
 void UpdateResolutionCap(Fast::Interpreter* interp) {
@@ -1407,7 +1427,11 @@ void UpdateResolutionCap(Fast::Interpreter* interp) {
         }
         const float oldMul = interp->mCurDimensions.internal_mul;
         const float curW = (float)interp->mCurDimensions.width;
-        float cap = kMaxEyeRenderWidth;
+        float scale = EnvFloat("PAPERBOAT_VR_RESSCALE");
+        if (scale <= 0.0f) {
+            scale = 1.0f;
+        }
+        float cap = kMaxEyeRenderWidth * scale;
         if (int forced = EnvInt("PAPERBOAT_VR_MAXW"); forced > 0) {
             cap = (float)forced;
         }
@@ -1524,20 +1548,9 @@ bool RenderGameFrame(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtxRep
         lastVisible = visible;
     }
     if (!visible) {
-        // Keep the session fed (so it can advance to VISIBLE) without rendering
-        // the game; the caller falls back to the normal desktop draw.
-        if (g_ctx->BeginFrame()) {
-            g_ctx->EndFrame(true);
-        }
+        // Let the normal desktop path draw; PresentFrame() keeps the session fed.
         return false;
     }
-
-    // --- temporary perf diagnostic ---
-    const auto perfNow = [] { return std::chrono::steady_clock::now(); };
-    const auto perfMs = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
-    static auto s_perfLast = perfNow();
-    static int s_perfFrames = 0;
-    static double s_perfWait = 0, s_perfRender = 0, s_perfGui = 0, s_perfPresent = 0, s_perfXr = 0;
 
     auto wnd = std::dynamic_pointer_cast<Fast::Fast3dWindow>(Ship::Context::GetRawInstance()->GetWindow());
     if (!wnd) {
@@ -1554,18 +1567,9 @@ bool RenderGameFrame(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtxRep
         g_ctx->didInitialRecenter = TryRecenter();
     }
 
-    // StartDraw sets mCurDimensions from the window; size swapchains to match
-    // before xrBeginFrame acquires them.
+    // StartDraw sets mCurDimensions from the window; size the eye targets to match.
     gui->StartDraw();
     EnsureRenderTargets(g_ctx, interp);
-
-    const auto pt0 = perfNow();
-    if (!g_ctx->BeginFrame()) {
-        gui->EndDraw();
-        return false;
-    }
-    const auto pt1 = perfNow();
-
     PrepareOffscreen(interp);
 
     const float half = g_stereoStrength * 0.5f;
@@ -1574,68 +1578,54 @@ bool RenderGameFrame(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtxRep
     EnsureCameraMatrices(base);
     // Render right first, left last, so the desktop mirror (which reads the last
     // mGfxFrameBuffer) shows the left eye.
-    RenderEyeToSwapchain(interp, g_ctx, 1, commands, base, +half);
-    RenderEyeToSwapchain(interp, g_ctx, 0, commands, base, -half);
-    const auto pt2 = perfNow();
+    RenderEyeToTex(interp, g_ctx, 1, commands, base, +half);
+    RenderEyeToTex(interp, g_ctx, 0, commands, base, -half);
 
-    // Our blitter leaves the last eye's swapchain bound as the render target.
-    // ImGui's DX11 backend does NOT set its own render target, so without this
-    // the menu/windows would be drawn into the headset. Rebinding the backbuffer
-    // sends the GUI to the desktop window as usual.
+    // Our blitter leaves an intermediate texture bound; ImGui's DX11 backend does
+    // not set its own render target, so rebind the backbuffer before the GUI draw.
     interp->GetCurrentRenderingAPI()->StartDrawToFramebuffer(0, 1.0f);
 
     if (!g_ctx->loggedFirstContent) {
         g_ctx->loggedFirstContent = true;
-        uintptr_t fb = interp->mGfxFrameBuffer;
-        D3D11_TEXTURE2D_DESC dd{}, sd{};
-        if (g_ctx->eyes[0].images.size() > 0 && g_ctx->eyes[0].images[g_ctx->eyes[0].acquiredIndex].texture) {
-            g_ctx->eyes[0].images[g_ctx->eyes[0].acquiredIndex].texture->GetDesc(&dd);
-        }
-        if (fb != 0) {
-            ComPtr<ID3D11Resource> res;
-            reinterpret_cast<ID3D11ShaderResourceView*>(fb)->GetResource(res.GetAddressOf());
-            ComPtr<ID3D11Texture2D> tx;
-            if (res) {
-                res.As(&tx);
-            }
-            if (tx) {
-                tx->GetDesc(&sd);
-            }
-        }
-        SPDLOG_INFO(
-            "[VR] first content: fbSrv=0x{:x} src={}x{} fmt{} -> swapchain {}x{} fmt{}; blitter={}; pose=({:.2f},{:.2f},{:.2f}) size=({:.2f}x{:.2f})",
-            (unsigned long long)fb, sd.Width, sd.Height, (int)sd.Format, dd.Width, dd.Height, (int)dd.Format,
-            g_ctx->blitter.ready, g_ctx->screenPose.position.x, g_ctx->screenPose.position.y,
-            g_ctx->screenPose.position.z, g_ctx->screenSize.width, g_ctx->screenSize.height);
+        SPDLOG_INFO("[VR] first content: render {}x{}, swapchain {}x{}; eye textures", g_ctx->renderWidth,
+                    g_ctx->renderHeight, g_ctx->eyes[0].width, g_ctx->eyes[0].height);
     }
 
+    // Present the desktop mirror (once per game frame; the headset is fed
+    // separately by PresentFrame at the display rate).
     gui->EndDraw();
-    const auto pt2a = perfNow();
     interp->EndFrame();
-    const auto pt2b = perfNow();
 
     g_ctx->haveContent = true;
-    g_ctx->EndFrame(true);
-    const auto pt3 = perfNow();
-
-    s_perfWait += perfMs(pt0, pt1);
-    s_perfRender += perfMs(pt1, pt2);
-    s_perfGui += perfMs(pt2, pt2a);
-    s_perfPresent += perfMs(pt2a, pt2b);
-    s_perfXr += perfMs(pt2b, pt3);
-    ++s_perfFrames;
-    {
-        const double dt = std::chrono::duration<double>(pt3 - s_perfLast).count();
-        if (dt >= 2.0) {
-            const double n = (double)s_perfFrames;
-            SPDLOG_INFO("[VR] perf xr_fps={:.0f} wait={:.1f} render={:.1f} gui={:.1f} present={:.1f} xr={:.1f} (ms)",
-                        n / dt, s_perfWait / n, s_perfRender / n, s_perfGui / n, s_perfPresent / n, s_perfXr / n);
-            s_perfLast = pt3;
-            s_perfFrames = 0;
-            s_perfWait = s_perfRender = s_perfGui = s_perfPresent = s_perfXr = 0;
-        }
-    }
     return true;
+}
+
+// Feeds the headset one frame at the display rate, reusing the most recent game
+// render. Called every main-loop iteration so frames are delivered in order and
+// on time regardless of how fast the game is rendering.
+void PresentFrame() {
+    if (!g_enabled || g_ctx == nullptr || !g_ctx->initialized) {
+        return;
+    }
+    g_ctx->PollEvents();
+    if (!g_ctx->sessionRunning) {
+        return;
+    }
+    const bool visible = VrDebugEnabled()
+                             ? true
+                             : (g_ctx->sessionState == XR_SESSION_STATE_FOCUSED ||
+                                g_ctx->sessionState == XR_SESSION_STATE_VISIBLE);
+    if (!visible) {
+        return;
+    }
+    if (!g_ctx->BeginFrame()) {
+        return;
+    }
+    if (g_ctx->haveContent) {
+        BlitEyeTexToSwapchain(g_ctx, 0);
+        BlitEyeTexToSwapchain(g_ctx, 1);
+    }
+    g_ctx->EndFrame(true);
 }
 
 void RenderIdleFrame() {
@@ -1679,6 +1669,7 @@ bool RenderGameFrame(Gfx*, const std::unordered_map<Mtx*, MtxF>&) {
     return false;
 }
 void RenderIdleFrame() {}
+void PresentFrame() {}
 void PollHotkeys() {}
 void Recenter() {}
 float GetScreenSize() {
