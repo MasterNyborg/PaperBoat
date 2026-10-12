@@ -152,29 +152,55 @@ class Blitter {
                                  "float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {\n"
                                  "  return tex.Sample(smp, uv);\n"
                                  "}";
-        // Keyed copy: the N64 RDP writes each sprite's own alpha, so an overlay's
-        // transparent texels both punch holes in, and (with a color key) show
-        // solid boxes for, the UI behind them. Derive the layer alpha as "the RDP
-        // alpha OR the color shows" on a transparent (black) clear: opaque
-        // wherever anything was drawn, transparent only where nothing was.
-        static const char* kPsKey = "Texture2D tex : register(t0);\n"
-                                    "SamplerState smp : register(s0);\n"
-                                    "float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {\n"
-                                    "  float4 c = tex.Sample(smp, uv);\n"
-                                    "  float a = (c.a > 0.004 || (c.r + c.g + c.b) > 0.004) ? 1.0 : 0.0;\n"
-                                    "  return float4(c.rgb, a);\n"
-                                    "}";
+        // Coverage recovery for the UI layer. The N64 UI is drawn over an opaque
+        // world and its alpha channel is unreliable, so no single-pass key can tell
+        // "transparent texel that wrote white" from real white UI -- hence the white
+        // boxes. Instead we render the UI twice, once over black and once over white.
+        // For an alpha-over composite blackResult = C*a and whiteResult = C*a+(1-a),
+        // so a = 1 - (white - black) and C = black / a: the exact straight-alpha
+        // layer. Where the two results are equal the draw ignored the backdrop
+        // (copy/no-blend), so fall back to the framebuffer's own alpha there.
+        static const char* kPsCombine =
+            "Texture2D texB : register(t0);\n"
+            "Texture2D texW : register(t1);\n"
+            "SamplerState smp : register(s0);\n"
+            "float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {\n"
+            "  float4 b4 = texB.Sample(smp, uv);\n"
+            "  float3 b = b4.rgb;\n"
+            "  float3 w = texW.Sample(smp, uv).rgb;\n"
+            "  float diff = dot(w - b, float3(0.333333,0.333333,0.333333));\n"
+            "  float recov = saturate(1.0 - saturate(diff));\n"
+            "  float a = (abs(diff) > 0.004) ? recov : b4.a;\n"
+            "  a = saturate(a);\n"
+            "  float3 c = a > 0.0001 ? b / a : float3(0,0,0);\n"
+            "  return float4(saturate(c), a);\n"
+            "}";
 
-        ComPtr<ID3DBlob> vsBlob, psBlob, keyBlob, err;
+        static const char* kPsOver = "Texture2D base : register(t0);\n"
+                                     "Texture2D ui : register(t1);\n"
+                                     "SamplerState smp : register(s0);\n"
+                                     "float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {\n"
+                                     "  float4 b = base.Sample(smp, uv);\n"
+                                     "  float4 u = ui.Sample(smp, uv);\n"
+                                     "  return float4(u.rgb * u.a + b.rgb * (1.0 - u.a), 1.0);\n"
+                                     "}";
+
+        ComPtr<ID3DBlob> vsBlob, psBlob, combBlob, overBlob, err;
         if (FAILED(compile(kVs, strlen(kVs), nullptr, nullptr, nullptr, "main", "vs_5_0", 0, 0, &vsBlob, &err)) ||
             FAILED(compile(kPs, strlen(kPs), nullptr, nullptr, nullptr, "main", "ps_5_0", 0, 0, &psBlob, &err)) ||
-            FAILED(compile(kPsKey, strlen(kPsKey), nullptr, nullptr, nullptr, "main", "ps_5_0", 0, 0, &keyBlob, &err))) {
+            FAILED(compile(kPsCombine, strlen(kPsCombine), nullptr, nullptr, nullptr, "main", "ps_5_0", 0, 0, &combBlob,
+                           &err)) ||
+            FAILED(compile(kPsOver, strlen(kPsOver), nullptr, nullptr, nullptr, "main", "ps_5_0", 0, 0, &overBlob,
+                           &err))) {
             SPDLOG_WARN("[VR] Shader compilation failed; falling back to CopyResource.");
             return false;
         }
         if (FAILED(device->CreateVertexShader(vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), nullptr, &vs)) ||
             FAILED(device->CreatePixelShader(psBlob->GetBufferPointer(), psBlob->GetBufferSize(), nullptr, &ps)) ||
-            FAILED(device->CreatePixelShader(keyBlob->GetBufferPointer(), keyBlob->GetBufferSize(), nullptr, &psKey))) {
+            FAILED(device->CreatePixelShader(combBlob->GetBufferPointer(), combBlob->GetBufferSize(), nullptr,
+                                             &psCombine)) ||
+            FAILED(device->CreatePixelShader(overBlob->GetBufferPointer(), overBlob->GetBufferSize(), nullptr,
+                                             &psOver))) {
             return false;
         }
 
@@ -214,10 +240,54 @@ class Blitter {
     bool ready = false;
 
     void Blit(ID3D11Device* device, ID3D11DeviceContext* ctx, ID3D11ShaderResourceView* srv,
-              ID3D11Texture2D* dst, DXGI_FORMAT dstFormat, uint32_t dstW, uint32_t dstH, bool keyed = false) {
-        if (!ready || !srv || !dst) {
+              ID3D11Texture2D* dst, DXGI_FORMAT dstFormat, uint32_t dstW, uint32_t dstH) {
+        if (!ready || !srv || !dst || !PrepareTarget(device, ctx, dst, dstFormat, dstW, dstH)) {
             return;
         }
+        ctx->PSSetShader(ps.Get(), nullptr, 0);
+        ctx->PSSetShaderResources(0, 1, &srv);
+        ctx->PSSetSamplers(0, 1, sampler.GetAddressOf());
+        ctx->Draw(3, 0);
+        UnbindSrv(ctx);
+    }
+
+    // Recovers the straight-alpha UI layer from the black/white backdrop passes
+    // (see kPsCombine) and writes it to dst.
+    void BlitCombine(ID3D11Device* device, ID3D11DeviceContext* ctx, ID3D11ShaderResourceView* srvBlack,
+                     ID3D11ShaderResourceView* srvWhite, ID3D11Texture2D* dst, DXGI_FORMAT dstFormat, uint32_t dstW,
+                     uint32_t dstH) {
+        if (!ready || !srvBlack || !srvWhite || !dst || !PrepareTarget(device, ctx, dst, dstFormat, dstW, dstH)) {
+            return;
+        }
+        ID3D11ShaderResourceView* srvs[2] = { srvBlack, srvWhite };
+        ctx->PSSetShader(psCombine.Get(), nullptr, 0);
+        ctx->PSSetShaderResources(0, 2, srvs);
+        ctx->PSSetSamplers(0, 1, sampler.GetAddressOf());
+        ctx->Draw(3, 0);
+        ID3D11ShaderResourceView* nullSrvs[2] = { nullptr, nullptr };
+        ctx->PSSetShaderResources(0, 2, nullSrvs);
+    }
+
+    // Composites the UI layer (straight-alpha) over a base image (the game/eye
+    // render) into dst. Used to show the headset's layered view on the desktop.
+    void BlitOver(ID3D11Device* device, ID3D11DeviceContext* ctx, ID3D11ShaderResourceView* baseSrv,
+                  ID3D11ShaderResourceView* uiSrv, ID3D11Texture2D* dst, DXGI_FORMAT dstFormat, uint32_t dstW,
+                  uint32_t dstH) {
+        if (!ready || !baseSrv || !uiSrv || !dst || !PrepareTarget(device, ctx, dst, dstFormat, dstW, dstH)) {
+            return;
+        }
+        ID3D11ShaderResourceView* srvs[2] = { baseSrv, uiSrv };
+        ctx->PSSetShader(psOver.Get(), nullptr, 0);
+        ctx->PSSetShaderResources(0, 2, srvs);
+        ctx->PSSetSamplers(0, 1, sampler.GetAddressOf());
+        ctx->Draw(3, 0);
+        ID3D11ShaderResourceView* nullSrvs[2] = { nullptr, nullptr };
+        ctx->PSSetShaderResources(0, 2, nullSrvs);
+    }
+
+  private:
+    bool PrepareTarget(ID3D11Device* device, ID3D11DeviceContext* ctx, ID3D11Texture2D* dst, DXGI_FORMAT dstFormat,
+                       uint32_t dstW, uint32_t dstH) {
         // The XR swapchain textures are created TYPELESS, so a default (nullptr)
         // RTV desc would fail; the format must be given explicitly.
         ComPtr<ID3D11RenderTargetView> rtv;
@@ -230,14 +300,12 @@ class Blitter {
                 SPDLOG_WARN("[VR] CreateRenderTargetView on swapchain (fmt {}) failed.", (int)dstFormat);
                 warned = true;
             }
-            return;
+            return false;
         }
-
         D3D11_VIEWPORT vp{};
         vp.Width = (float)dstW;
         vp.Height = (float)dstH;
         vp.MaxDepth = 1.0f;
-
         ID3D11RenderTargetView* rtvRaw = rtv.Get();
         ctx->OMSetRenderTargets(1, &rtvRaw, nullptr);
         ctx->OMSetDepthStencilState(depthOff.Get(), 0);
@@ -247,21 +315,19 @@ class Blitter {
         ctx->IASetInputLayout(nullptr);
         ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         ctx->VSSetShader(vs.Get(), nullptr, 0);
-        ctx->PSSetShader(keyed ? psKey.Get() : ps.Get(), nullptr, 0);
-        ctx->PSSetShaderResources(0, 1, &srv);
-        ctx->PSSetSamplers(0, 1, sampler.GetAddressOf());
-        ctx->Draw(3, 0);
+        return true;
+    }
 
+    static void UnbindSrv(ID3D11DeviceContext* ctx) {
         ID3D11ShaderResourceView* nullSrv = nullptr;
         ctx->PSSetShaderResources(0, 1, &nullSrv);
     }
-
-  private:
     typedef HRESULT(WINAPI* PFN_D3DCOMPILE)(LPCVOID, SIZE_T, LPCSTR, const D3D_SHADER_MACRO*, ID3DInclude*, LPCSTR,
                                             LPCSTR, UINT, UINT, ID3DBlob**, ID3DBlob**);
     ComPtr<ID3D11VertexShader> vs;
     ComPtr<ID3D11PixelShader> ps;
-    ComPtr<ID3D11PixelShader> psKey;
+    ComPtr<ID3D11PixelShader> psCombine;
+    ComPtr<ID3D11PixelShader> psOver;
     ComPtr<ID3D11SamplerState> sampler;
     ComPtr<ID3D11RasterizerState> raster;
     ComPtr<ID3D11DepthStencilState> depthOff;
@@ -332,6 +398,10 @@ class Context {
     ComPtr<ID3D11ShaderResourceView> eyeSrv[2];
     ComPtr<ID3D11Texture2D> uiTex;
     ComPtr<ID3D11ShaderResourceView> uiSrv;
+    // Intermediate results of the two coverage passes (UI over black / over white)
+    // that BlitCombine turns into the final straight-alpha uiTex.
+    ComPtr<ID3D11Texture2D> uiBlackTex, uiWhiteTex;
+    ComPtr<ID3D11ShaderResourceView> uiBlackSrv, uiWhiteSrv;
     bool haveUiContent = false;
     XrPosef screenPose{ { 0, 0, 0, 1 }, { 0, 0, -kDefaultScreenDistance } };
     XrExtent2Df screenSize{ kDefaultScreenSize, kDefaultScreenSize * 0.75f };
@@ -991,17 +1061,22 @@ void Context::CreateEyeTextures(uint32_t width, uint32_t height) {
         desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM; // matches the game framebuffer
         desc.SampleDesc.Count = 1;
         desc.Usage = D3D11_USAGE_DEFAULT;
-        // RENDER_TARGET so the blitter can draw into it (the UI copy runs a
-        // chroma-key pixel shader, which needs an RTV).
+        // RENDER_TARGET so the blitter can draw into it (the UI coverage combine
+        // runs a pixel shader, which needs an RTV).
         desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
-        if (SUCCEEDED(device->CreateTexture2D(&desc, nullptr, tex.GetAddressOf()))) {
+        const HRESULT hr = device->CreateTexture2D(&desc, nullptr, tex.GetAddressOf());
+        if (SUCCEEDED(hr)) {
             device->CreateShaderResourceView(tex.Get(), nullptr, srv.GetAddressOf());
+        } else {
+            SPDLOG_WARN("[VR] CreateTexture2D {}x{} failed: 0x{:08X}", width, height, (uint32_t)hr);
         }
     };
     for (int e = 0; e < 2; ++e) {
         makeTex(eyeTex[e], eyeSrv[e]);
     }
     makeTex(uiTex, uiSrv);
+    makeTex(uiBlackTex, uiBlackSrv);
+    makeTex(uiWhiteTex, uiWhiteSrv);
 }
 
 void Context::DestroySwapchains() {
@@ -1513,11 +1588,9 @@ void DumpTextureBmp(Context* c, ID3D11Texture2D* tex, const char* path) {
     c->DeviceContext()->Unmap(staging.Get(), 0);
 }
 
-// Clears the game framebuffer to fully transparent black. The keyed copy
-// (kPsKey) then makes everything the UI did not draw transparent. The engine's
-// ClearFramebuffer always clears to its own colour, so do it ourselves on the
-// fb's own texture.
-void ClearGameFbTransparent(Context* c, Fast::Interpreter* interp) {
+// Clears the game framebuffer to a given colour. The engine's ClearFramebuffer
+// always clears to its own colour, so do it ourselves on the fb's own texture.
+void ClearGameFb(Context* c, Fast::Interpreter* interp, float r, float g, float b, float a) {
     uintptr_t fb = interp->mGfxFrameBuffer;
     if (fb == 0) {
         return;
@@ -1541,7 +1614,7 @@ void ClearGameFbTransparent(Context* c, Fast::Interpreter* interp) {
     if (FAILED(c->Device()->CreateRenderTargetView(tex.Get(), &rtvDesc, &rtv))) {
         return;
     }
-    const float clear[4] = { 0.0f, 0.0f, 0.0f, 0.0f }; // transparent
+    const float clear[4] = { r, g, b, a };
     c->DeviceContext()->ClearRenderTargetView(rtv.Get(), clear);
 }
 
@@ -1550,12 +1623,12 @@ void ClearGameFbTransparent(Context* c, Fast::Interpreter* interp) {
 // rendered with an empty matrix map so it is screen-space only (never the 3D
 // perspective) and identical in both eyes.
 void RenderUiToTex(Fast::Interpreter* interp, Context* c, Gfx* uiCommands) {
-    if (uiCommands == nullptr || !c->uiTex || !c->uiSrv) {
+    if (uiCommands == nullptr || !c->uiTex || !c->uiSrv || !c->uiBlackTex || !c->uiWhiteTex) {
         static bool s_warned = false;
         if (!s_warned) {
             s_warned = true;
-            SPDLOG_WARN("[VR] UI layer skipped: uiCommands={} uiTex={} uiSrv={}", (void*)uiCommands, (bool)c->uiTex,
-                        (bool)c->uiSrv);
+            SPDLOG_WARN("[VR] UI layer skipped: uiCommands={} uiTex={} uiBlack={} uiWhite={}", (void*)uiCommands,
+                        (bool)c->uiTex, (bool)c->uiBlackTex, (bool)c->uiWhiteTex);
         }
         return;
     }
@@ -1565,27 +1638,75 @@ void RenderUiToTex(Fast::Interpreter* interp, Context* c, Gfx* uiCommands) {
         SPDLOG_INFO("[VR] UI layer active: list={} fb={}x{}", (void*)uiCommands, c->renderWidth, c->renderHeight);
     }
     auto* rapi = interp->GetCurrentRenderingAPI();
-    rapi->StartDrawToFramebuffer(interp->mGameFb, 1.0f);
-    rapi->ClearFramebuffer(false, true); // depth only; colour cleared to the key below
-    ClearGameFbTransparent(c, interp);
-    interp->Run(uiCommands, {}, {});
-    // Copy with a coverage key so the layer alpha reflects what the UI drew (see
-    // kPsKey) instead of the RDP's per-sprite alpha, which punches holes.
     uintptr_t fb = interp->mGfxFrameBuffer;
-    if (fb != 0 && c->uiTex && c->blitter.ready) {
-        auto* srv = reinterpret_cast<ID3D11ShaderResourceView*>(fb);
-        c->blitter.Blit(c->Device(), c->DeviceContext(), srv, c->uiTex.Get(), DXGI_FORMAT_R8G8B8A8_UNORM,
-                        c->renderWidth, c->renderHeight, /*keyed=*/true);
+    if (fb == 0 || !c->blitter.ready) {
+        return;
     }
+    auto* fbSrv = reinterpret_cast<ID3D11ShaderResourceView*>(fb);
+
+    // Render the UI twice, once over black and once over white, then combine (see
+    // kPsCombine) to recover its true straight-alpha coverage. The N64 UI is drawn
+    // over an opaque world and its own alpha is unreliable (transparent texels
+    // carry arbitrary colour), so a single pass produces either holes or solid
+    // boxes around sprites.
+    const float clears[2][4] = { { 0.0f, 0.0f, 0.0f, 1.0f }, { 1.0f, 1.0f, 1.0f, 1.0f } };
+    for (int pass = 0; pass < 2; ++pass) {
+        // NB: get the raw pointer with Get(); taking &ComPtr would invoke WRL's
+        // overloaded operator& and yield a temporary ComPtrRef proxy.
+        ID3D11Texture2D* dst = (pass == 0) ? c->uiBlackTex.Get() : c->uiWhiteTex.Get();
+        rapi->StartDrawToFramebuffer(interp->mGameFb, 1.0f);
+        rapi->ClearFramebuffer(false, true); // depth only
+        ClearGameFb(c, interp, clears[pass][0], clears[pass][1], clears[pass][2], clears[pass][3]);
+        interp->Run(uiCommands, {}, {});
+        c->blitter.Blit(c->Device(), c->DeviceContext(), fbSrv, dst, DXGI_FORMAT_R8G8B8A8_UNORM, c->renderWidth,
+                        c->renderHeight);
+    }
+    c->blitter.BlitCombine(c->Device(), c->DeviceContext(), c->uiBlackSrv.Get(), c->uiWhiteSrv.Get(), c->uiTex.Get(),
+                           DXGI_FORMAT_R8G8B8A8_UNORM, c->renderWidth, c->renderHeight);
     c->haveUiContent = true;
+
+    // Debug dump: a rolling ring (last ~30 s) of the combined UI, its two coverage
+    // passes, and the eye render, so a reproduced artefact is left on disk to read.
     static int s_dumpFrame = 0;
-    if (std::getenv("PAPERBOAT_VR_DUMP") != nullptr && (++s_dumpFrame % 60) == 1 && s_dumpFrame <= 60 * 180) {
+    if (std::getenv("PAPERBOAT_VR_DUMP") != nullptr && (++s_dumpFrame % 30) == 0) {
+        const int slot = (s_dumpFrame / 30) % 60;
         char p[64];
-        snprintf(p, sizeof(p), "dump/ui_%03d.bmp", s_dumpFrame / 60);
+        snprintf(p, sizeof(p), "dump/ui_%02d.bmp", slot);
         DumpTextureBmp(c, c->uiTex.Get(), p);
-        snprintf(p, sizeof(p), "dump/eye_%03d.bmp", s_dumpFrame / 60);
+        snprintf(p, sizeof(p), "dump/wht_%02d.bmp", slot);
+        DumpTextureBmp(c, c->uiWhiteTex.Get(), p);
+        snprintf(p, sizeof(p), "dump/blk_%02d.bmp", slot);
+        DumpTextureBmp(c, c->uiBlackTex.Get(), p);
+        snprintf(p, sizeof(p), "dump/eye_%02d.bmp", slot);
         DumpTextureBmp(c, c->eyeTex[0].Get(), p);
     }
+}
+
+// Composites the recovered UI layer over the (left-eye) game render into the game
+// framebuffer, so the desktop window shows the same layered image as the headset
+// (the desktop GUI draws mGfxFrameBuffer directly).
+void CompositeUiOntoDesktop(Fast::Interpreter* interp, Context* c) {
+    if (!c->haveUiContent || !c->uiSrv || !c->eyeSrv[0] || !c->blitter.ready) {
+        return;
+    }
+    uintptr_t fb = interp->mGfxFrameBuffer;
+    if (fb == 0) {
+        return;
+    }
+    auto* srv = reinterpret_cast<ID3D11ShaderResourceView*>(fb);
+    ComPtr<ID3D11Resource> res;
+    srv->GetResource(res.GetAddressOf());
+    ComPtr<ID3D11Texture2D> tex;
+    if (res) {
+        res.As(&tex);
+    }
+    if (!tex) {
+        return;
+    }
+    D3D11_TEXTURE2D_DESC d{};
+    tex->GetDesc(&d);
+    c->blitter.BlitOver(c->Device(), c->DeviceContext(), c->eyeSrv[0].Get(), c->uiSrv.Get(), tex.Get(),
+                        UnormViewFormat(d.Format), c->renderWidth, c->renderHeight);
 }
 
 // Makes the next Run() render offscreen into mGameFb at the interpreter's
@@ -2106,6 +2227,17 @@ bool RenderGameFrame(Gfx* commands, Gfx* uiCommands, const std::unordered_map<Mt
     const double tEye1 = NowMs();
     RenderEyeToTex(interp, g_ctx, 0, commands, base, -half);
     const double tEye0 = NowMs();
+
+    // Desktop mirror: composite the UI layer over the (left-eye) game render so the
+    // desktop window shows the same layered image the headset gets. On by default
+    // while VR is active; PAPERBOAT_VR_DESKTOP_UI=0 disables.
+    static const bool s_desktopUi = [] {
+        const char* v = std::getenv("PAPERBOAT_VR_DESKTOP_UI");
+        return v == nullptr || std::atoi(v) != 0;
+    }();
+    if (s_desktopUi) {
+        CompositeUiOntoDesktop(interp, g_ctx);
+    }
 
     // Our blitter leaves an intermediate texture bound; ImGui's DX11 backend does
     // not set its own render target, so rebind the backbuffer before the GUI draw.

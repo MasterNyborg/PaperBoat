@@ -23,6 +23,30 @@ DirectX 11 only. The rest of the port talks to this module only through
   `&gDisplayContext->camPerspMatrix[cam]` for the perspective cameras (0,1,2);
   the HUD camera (3, orthographic) is left mono.
 
+### On-screen UI as a separate layer
+
+The 2D HUD/dialogue/menu is rendered **once** (mono, screen-space) into its own
+texture and submitted as a second quad layer floated just in front of the 3D
+screen (Settings → VR → *UI Distance*). Because it is its own layer it can never
+be clipped by, or clash with, scene depth. `src/main_loop.c` splits the display
+list into a world list and a UI list (`UI_GFX_BEGIN/END`), the UI list reaching
+`RenderGameFrame` as `uiCommands`.
+
+The N64 UI is drawn over an **opaque** world and its alpha channel is unreliable
+(sprites write their own alpha; transparent texels carry arbitrary colour), so a
+single pass gives either holes punched through panels or solid boxes around
+icons. So the UI is rendered **twice**, once over black and once over white, and
+combined (`kPsCombine`):
+
+```
+black = C*a            white = C*a + (1-a)
+a = 1 - (white - black)          C = black / a
+```
+
+which recovers the exact straight-alpha layer to hand the compositor. Where the
+two passes are identical the draw ignored the backdrop (copy/no-blend), so the
+framebuffer's own alpha is used instead.
+
 ### Decoupled frame delivery (game rate ≠ display rate)
 
 A 60 fps game on a 120 Hz headset must still be *delivered* at the display rate,
@@ -107,6 +131,9 @@ called, so they survive restarts and work even with no headset attached.
 | `PAPERBOAT_VR_RESSCALE=F` | Scale the per-eye render-resolution cap. |
 | `PAPERBOAT_VR_MAXW=N` | Absolute per-eye render-width cap (px). |
 | `PAPERBOAT_VR_MIRROR=N` | Desktop spectator-mirror period in game frames (default 2 = ~30 Hz; 0 disables). Do **not** use 1: presenting every game frame re-engages the ~12 ms present limiter and pins the headset to the game rate. |
+| `PAPERBOAT_VR_DUMP=1` | Write a rolling ring (last ~30 s) of the combined UI layer, its black/white coverage passes and the eye render to `build/<preset>/dump/` as BMPs. |
+| `PAPERBOAT_QUICK_LAUNCH=1` | Skip the title/file-select and load the last save immediately (debug, requires `DX_QUICK_LAUNCH` in `src/dx/config.h`). |
+| `PAPERBOAT_BOOT_BATTLE="b,stage"` | (Debug, with quick launch) boot straight into a battle, e.g. `"0,2"`. `"none"` boots to the overworld instead. |
 
 ## Tuning / gotchas
 

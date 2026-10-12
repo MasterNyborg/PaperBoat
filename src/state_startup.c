@@ -5,6 +5,7 @@
 #include "game_modes.h"
 #include "dx/config.h"
 #include "dx/versioning.h"
+#include <stdlib.h>
 
 // Set by the port's "reset" command.
 b32 gPortResetToTitleScreen = false;
@@ -95,12 +96,16 @@ void state_step_startup(void) {
     }
 
     #if DX_QUICK_LAUNCH
-        // immediately jump into the world using last-used save file
-        gGameStatus.saveSlot = gSaveGlobals.lastFileSelected;
-        if (fio_load_game(gGameStatusPtr->saveSlot)) {
-            set_game_mode(GAME_MODE_ENTER_WORLD);
-            gOverrideFlags &= ~GLOBAL_OVERRIDES_DISABLE_RENDER_WORLD;
-            return;
+        // Fast debug boot (opt-in): only when PAPERBOAT_QUICK_LAUNCH is set, so a
+        // normal launch still shows the title / file-select.
+        if (getenv("PAPERBOAT_QUICK_LAUNCH") != NULL) {
+            // immediately jump into the world using last-used save file
+            gGameStatus.saveSlot = gSaveGlobals.lastFileSelected;
+            if (fio_load_game(gGameStatusPtr->saveSlot)) {
+                set_game_mode(GAME_MODE_ENTER_WORLD);
+                gOverrideFlags &= ~GLOBAL_OVERRIDES_DISABLE_RENDER_WORLD;
+                return;
+            }
         }
     #endif
 

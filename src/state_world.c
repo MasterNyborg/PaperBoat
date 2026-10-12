@@ -2,7 +2,11 @@
 #include "npc.h"
 #include "game_modes.h"
 #include "dx/config.h"
+#include "dx/debug_menu.h"
 #include "dx/profiling.h"
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
 
 void state_world_draw_aux_ui(void);
 
@@ -11,7 +15,18 @@ void state_init_world(void) {
 
 #ifdef DX_QUICK_LAUNCH_BATTLE
     if (gGameStatus.loadType == LOAD_FROM_FILE_SELECT) {
-        dx_debug_begin_battle_with_IDs(DX_QUICK_LAUNCH_BATTLE);
+        // Port debug hook: boot straight into a battle without recompiling.
+        // PAPERBOAT_BOOT_BATTLE="battle,stage" (decimal or 0x hex), e.g. "0,2".
+        const char* env = getenv("PAPERBOAT_BOOT_BATTLE");
+        if (env != NULL && env[0] != '\0') {
+            if (strcmp(env, "none") != 0) { // "none" = stay in the overworld
+                long battle = 0, stage = -1;
+                sscanf(env, "%li,%li", &battle, &stage);
+                dx_debug_begin_battle_with_IDs((s16)battle, (s16)stage);
+            }
+        } else {
+            dx_debug_begin_battle_with_IDs(DX_QUICK_LAUNCH_BATTLE);
+        }
     }
 #endif
 }
