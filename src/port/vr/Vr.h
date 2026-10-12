@@ -28,6 +28,12 @@ void Shutdown();
 // headset is possible). Independent of focus.
 bool IsSessionRunning();
 
+// Pumps OpenXR events (session state transitions, instance/profile changes).
+// Must be called every main-loop iteration, unconditionally: the session only
+// advances to READY/RUNNING in response to events, so gating this on an already
+// running session would deadlock startup.
+void PollEvents();
+
 // User toggle. When false, VR rendering is skipped entirely even if the session
 // is alive (handy for A/B testing / falling back to a plain desktop window).
 bool GetEnabled();
@@ -56,10 +62,6 @@ void UpdateResolutionCap(Fast::Interpreter* interpreter);
 // Returns false when VR is inactive/unfocused so the caller falls back to the
 // regular desktop path.
 bool RenderGameFrame(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtxReplacements);
-
-// Keeps the headset session alive (submits the last rendered image) on frames
-// where the game produced no new display list (loading screens, stalls).
-void RenderIdleFrame();
 
 // Submits one frame to the headset at the display rate, reusing the most recent
 // game render. Call once per main-loop iteration so the headset always receives

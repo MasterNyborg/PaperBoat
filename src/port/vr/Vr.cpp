@@ -4,10 +4,15 @@
 //   * OpenXR composition *quad layers* do the hard work: the runtime world-locks
 //     the screen, tracks the head, applies lens distortion and composites. We
 //     only supply a per-eye texture + a pose + a size.
-//   * The game is rendered twice per frame (once per eye) through libultraship's
-//     public Interpreter API. We force the frame offscreen into the game FBO
-//       (mGameFb), reuse it for both eyes (clearing colour between them), and
-//     copy each result into that eye's XR swapchain image.
+//   * The game is rendered twice per game frame (once per eye) through
+//     libultraship's public Interpreter API. We force the frame offscreen into
+//     the game FBO (mGameFb), reuse it for both eyes (clearing colour between
+//     them), and copy each result into an intermediate eye texture.
+//   * Delivery is decoupled from rendering: RenderGameFrame fills the eye
+//     textures at the game's rate; PresentFrame (once per main-loop iteration)
+//     runs the OpenXR frame and blits the latest eye textures into the swapchains
+//     at the display rate. A 60 fps game therefore still gets a fresh submission
+//     every 120 Hz display tick.
 //   * Stereo is produced by shifting the game's combined projection*view matrix
 //     by a small eye-space translation. The game bakes view into the projection
 //     matrix (cam_main.c), so in row-major convention an eye offset is:
@@ -289,6 +294,7 @@ class Context {
     uint32_t renderHeight = 0;
     float renderAspect = 0.0f; // captured once from the game camera viewport
     EyeSwapchain eyes[2];
+    bool eyeValid[2] = { false, false }; // successfully acquired+waited this frame
     Blitter blitter;
     // The game renders into these at its own rate; the presentation step copies
     // them into the XR swapchains at the headset rate (decoupled frame delivery).
@@ -323,10 +329,81 @@ class Context {
 
 Context* g_ctx = nullptr;
 
-// Settings (kept here; surfaced through the getters/setters below).
+// Settings (kept here; surfaced through the getters/setters below and persisted
+// as console variables so they survive a restart).
 bool g_enabled = true;
+float g_screenWidth = kDefaultScreenSize; // metres
 float g_screenDistance = kDefaultScreenDistance;
 float g_stereoStrength = kDefaultStereoStrength;
+
+// Watchdog for a runtime that stopped presenting (headset asleep/disconnected).
+// If an XR frame takes pathologically long, or the swapchains stop being handed
+// over, we stop pumping the XR frame loop so the game keeps running on the
+// desktop at full speed; we then retry periodically to resume when it comes back.
+bool g_pumpPaused = false;
+double g_pumpRetryAtMs = 0.0;
+
+// ---------------------------------------------------------------------------
+// Temporary frame-timing instrumentation (removed once pacing is verified).
+// ---------------------------------------------------------------------------
+double NowMs() {
+    static const auto start = std::chrono::steady_clock::now();
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+}
+struct FramePerf {
+    double lastLog = NowMs();
+    double waitMs = 0, blitMs = 0, endMs = 0, renderMs = 0;
+    double waitMax = 0, blitMax = 0, endMax = 0, renderMax = 0;
+    double prepMs = 0, eye1Ms = 0, eye0Ms = 0, guiMs = 0, deskMs = 0;
+    int present = 0, renders = 0, shouldRender = 0, beginFail = 0, endFail = 0;
+};
+FramePerf g_perf;
+
+// True when VR should own rendering this frame: enabled, session running, and
+// not currently backing off from a stalled/absent runtime.
+bool VrActive() {
+    return g_enabled && g_ctx != nullptr && g_ctx->sessionRunning && !g_pumpPaused;
+}
+
+// Pauses the XR frame pump for `delayMs` (the runtime stopped presenting).
+void PausePump(const char* why) {
+    if (!g_pumpPaused) {
+        SPDLOG_WARN("[VR] Runtime not presenting ({}); pausing headset submission, running on desktop.", why);
+    }
+    g_pumpPaused = true;
+    g_pumpRetryAtMs = NowMs() + 1000.0;
+}
+
+// Clears a pause early (e.g. when the session state actually changes).
+void ResumePumpIfPaused() {
+    if (g_pumpPaused) {
+        g_pumpPaused = false;
+        SPDLOG_INFO("[VR] Session state changed; resuming headset submission.");
+    }
+}
+
+void LogPerfIfNeeded(const char* phase) {
+    static const bool enabled =
+        std::getenv("PAPERBOAT_VR_PERF") != nullptr || std::getenv("PAPERBOAT_VR_DEBUG") != nullptr;
+    if (!enabled) {
+        return;
+    }
+    const double now = NowMs();
+    const double dt = now - g_perf.lastLog;
+    if (dt < 2000.0 || g_perf.present == 0) {
+        return;
+    }
+    const double n = (double)g_perf.present;
+    const double r = (double)std::max(1, g_perf.renders);
+    SPDLOG_INFO(
+        "[VR] perf[{}] present_fps={:.1f} game_fps={:.1f} | wait {:.2f} blit {:.2f} end {:.2f} | render {:.2f} "
+        "(prep {:.2f} eye1 {:.2f} eye0 {:.2f} gui {:.2f} desk {:.2f}) max {:.1f}/{:.1f} | shouldRender={}/{} beginFail={}",
+        phase, n * 1000.0 / dt, (double)g_perf.renders * 1000.0 / dt, g_perf.waitMs / n, g_perf.blitMs / n,
+        g_perf.endMs / n, g_perf.renderMs / r, g_perf.prepMs / r, g_perf.eye1Ms / r, g_perf.eye0Ms / r, g_perf.guiMs / r,
+        g_perf.deskMs / r, g_perf.renderMax, g_perf.waitMax, g_perf.shouldRender, g_perf.present, g_perf.beginFail);
+    g_perf = FramePerf{};
+    g_perf.lastLog = now;
+}
 
 // ---------------------------------------------------------------------------
 // Small math helpers
@@ -923,6 +1000,8 @@ void Context::PollEvents() {
             auto* changed = reinterpret_cast<XrEventDataSessionStateChanged*>(&ev);
             sessionState = changed->state;
             SPDLOG_INFO("[VR] Session state -> {}", (int)sessionState);
+            // Any real state change is a good moment to stop backing off.
+            ResumePumpIfPaused();
             switch (sessionState) {
                 case XR_SESSION_STATE_READY: {
                     XrSessionBeginInfo bi{ XR_TYPE_SESSION_BEGIN_INFO };
@@ -939,13 +1018,22 @@ void Context::PollEvents() {
                     break;
                 case XR_SESSION_STATE_EXITING:
                 case XR_SESSION_STATE_LOSS_PENDING:
+                    // The runtime is going away (headset removed / SteamVR quit).
+                    // Stop feeding it so the game falls back to the desktop and
+                    // never calls into a dead session.
                     exitRequested = true;
+                    sessionRunning = false;
                     break;
                 default:
                     break;
             }
         } else if (ev.type == XR_TYPE_EVENT_DATA_INSTANCE_LOSS_PENDING) {
             exitRequested = true;
+            sessionRunning = false;
+        } else if (ev.type == XR_TYPE_EVENT_DATA_REFERENCE_SPACE_CHANGE_PENDING) {
+            // The runtime recentered/reconfigured tracking; re-anchor the screen.
+            didInitialRecenter = false;
+            SPDLOG_INFO("[VR] Reference space changed; re-centering the screen.");
         } else if (ev.type == XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED) {
             // Log which controller profile the runtime bound (useful when a
             // headset streams through e.g. Virtual Desktop + SteamVR).
@@ -968,6 +1056,7 @@ void Context::PollEvents() {
 
 void Context::AcquireEye(int e) {
     EyeSwapchain& sc = eyes[e];
+    eyeValid[e] = false;
     if (sc.handle == XR_NULL_HANDLE || sc.acquired) {
         return;
     }
@@ -975,12 +1064,27 @@ void Context::AcquireEye(int e) {
     if (Failed(xrAcquireSwapchainImage(sc.handle, &ai, &sc.acquiredIndex), "xrAcquireSwapchainImage")) {
         return;
     }
+    // A finite timeout: if the runtime can't hand over the image in time (e.g.
+    // the compositor stopped consuming because the headset went to sleep), give
+    // up on this eye instead of blocking the whole loop.
     XrSwapchainImageWaitInfo wi{ XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
-    wi.timeout = XR_INFINITE_DURATION;
-    if (Failed(xrWaitSwapchainImage(sc.handle, &wi), "xrWaitSwapchainImage")) {
+    wi.timeout = 10 * 1000 * 1000; // 10 ms
+    const XrResult r = xrWaitSwapchainImage(sc.handle, &wi);
+    if (r == XR_TIMEOUT_EXPIRED) {
+        XrSwapchainImageReleaseInfo ri{ XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
+        xrReleaseSwapchainImage(sc.handle, &ri);
+        static bool warned = false;
+        if (!warned) {
+            SPDLOG_WARN("[VR] xrWaitSwapchainImage timed out (eye {}); skipping frame.", e);
+            warned = true;
+        }
+        return;
+    }
+    if (Failed(r, "xrWaitSwapchainImage")) {
         return;
     }
     sc.acquired = true;
+    eyeValid[e] = true;
 }
 
 void Context::ReleaseEye(int e) {
@@ -1032,6 +1136,9 @@ void Context::SubmitLayers(bool submitContent) {
     if (submitContent) {
         const XrEyeVisibility vis[2] = { XR_EYE_VISIBILITY_LEFT, XR_EYE_VISIBILITY_RIGHT };
         for (int e = 0; e < 2; ++e) {
+            if (!eyeValid[e] || eyes[e].handle == XR_NULL_HANDLE) {
+                continue; // never submit an image we did not acquire+release
+            }
             XrCompositionLayerQuad& q = quads[e];
             q = { XR_TYPE_COMPOSITION_LAYER_QUAD };
             q.layerFlags = 0;
@@ -1332,9 +1439,46 @@ bool TryRecenter() {
 } // namespace
 
 // ---------------------------------------------------------------------------
+// Settings persistence (console variables)
+// ---------------------------------------------------------------------------
+constexpr const char* kCvarEnabled = "gVR.Enabled";
+constexpr const char* kCvarScreenSize = "gVR.ScreenSize";
+constexpr const char* kCvarScreenDistance = "gVR.ScreenDistance";
+constexpr const char* kCvarStereoStrength = "gVR.StereoStrength";
+
+// Loads persisted settings into the module globals. Lazy + idempotent so it
+// works no matter whether the settings menu is built before or after the OpenXR
+// session is created (and even when there is no runtime/headset at all).
+void LoadSettings() {
+    static bool loaded = false;
+    if (loaded || Ship::Context::GetRawInstance() == nullptr) {
+        return;
+    }
+    loaded = true;
+    g_enabled = CVarGetInteger(kCvarEnabled, 1) != 0;
+    g_screenWidth = CVarGetFloat(kCvarScreenSize, kDefaultScreenSize);
+    g_screenDistance = CVarGetFloat(kCvarScreenDistance, kDefaultScreenDistance);
+    g_stereoStrength = CVarGetFloat(kCvarStereoStrength, kDefaultStereoStrength);
+    SPDLOG_INFO("[VR] Settings loaded: enabled={} screenSize={:.2f}m distance={:.2f}m stereo={:.2f}", g_enabled,
+                g_screenWidth, g_screenDistance, g_stereoStrength);
+}
+
+// Pushes the loaded settings into the live session (screen size + distance).
+void ApplySettingsToContext() {
+    if (g_ctx == nullptr) {
+        return;
+    }
+    const float aspect = g_ctx->renderWidth > 0 ? (float)g_ctx->renderHeight / (float)g_ctx->renderWidth : 0.75f;
+    g_ctx->screenSize.width = g_screenWidth;
+    g_ctx->screenSize.height = g_screenWidth * aspect;
+    g_ctx->screenPose.position.z = -g_screenDistance;
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 bool Initialize() {
+    LoadSettings();
     if (g_ctx != nullptr && g_ctx->initialized) {
         return true;
     }
@@ -1347,6 +1491,7 @@ bool Initialize() {
         g_ctx = nullptr;
         return false;
     }
+    ApplySettingsToContext();
     return true;
 }
 
@@ -1362,12 +1507,31 @@ bool IsSessionRunning() {
     return g_ctx != nullptr && g_ctx->sessionRunning;
 }
 
+void PollEvents() {
+    if (g_ctx == nullptr) {
+        return;
+    }
+    g_ctx->PollEvents();
+    // The runtime told us it is exiting (SteamVR quit / HMD link dropped for
+    // good): tear the OpenXR objects down immediately. Leaving a half-dead
+    // session around while the runtime unloads makes the loader/runtime fall over
+    // a few seconds later. (A mere sleep sends STOPPING/IDLE, not EXITING, so the
+    // session is kept and resumes on wake.)
+    if (g_ctx->exitRequested) {
+        SPDLOG_INFO("[VR] Runtime exiting; shutting down OpenXR.");
+        Shutdown();
+    }
+}
+
 bool GetEnabled() {
+    LoadSettings();
     return g_enabled;
 }
 
 void SetEnabled(bool enabled) {
+    LoadSettings();
     g_enabled = enabled;
+    CVarSetInteger(kCvarEnabled, enabled ? 1 : 0);
 }
 
 bool GetVrPad(uint16_t& buttons, int8_t& stickX, int8_t& stickY) {
@@ -1385,7 +1549,7 @@ uint32_t GetTargetFpsOverride() {
     // every display tick by PresentFrame() regardless (60 fps game content on a
     // 120 Hz headset, each game frame delivered twice, evenly). 60 gives two
     // sub-frames per 30 Hz game tick. PAPERBOAT_VR_FPS forces a value.
-    if (!g_enabled || g_ctx == nullptr || !g_ctx->sessionRunning) {
+    if (!VrActive()) {
         return 0;
     }
     if (int forced = EnvInt("PAPERBOAT_VR_FPS"); forced > 0) {
@@ -1400,7 +1564,7 @@ void UpdateResolutionCap(Fast::Interpreter* interp) {
     }
     static float s_savedMul = -1.0f;
     static int s_savedVsync = -1;
-    const bool vrActive = g_enabled && g_ctx != nullptr && g_ctx->sessionRunning;
+    const bool vrActive = VrActive();
 
     // The desktop window's present (vsync + its own frame-interval pacing) runs
     // inside the XR frame loop and throttles the headset, so force it off while
@@ -1453,43 +1617,51 @@ void Recenter() {
 }
 
 float GetScreenSize() {
-    return g_ctx ? g_ctx->screenSize.width : kDefaultScreenSize;
+    LoadSettings();
+    return g_screenWidth;
 }
 
 void SetScreenSize(float metres) {
-    if (!g_ctx) {
-        return;
-    }
+    LoadSettings();
     metres = std::clamp(metres, 0.25f, 12.0f);
-    const float aspect = g_ctx->renderWidth > 0 ? (float)g_ctx->renderHeight / (float)g_ctx->renderWidth : 0.75f;
-    g_ctx->screenSize.width = metres;
-    g_ctx->screenSize.height = metres * aspect;
+    g_screenWidth = metres;
+    CVarSetFloat(kCvarScreenSize, metres);
+    if (g_ctx) {
+        const float aspect = g_ctx->renderWidth > 0 ? (float)g_ctx->renderHeight / (float)g_ctx->renderWidth : 0.75f;
+        g_ctx->screenSize.width = metres;
+        g_ctx->screenSize.height = metres * aspect;
+    }
 }
 
 float GetScreenDistance() {
+    LoadSettings();
     return g_screenDistance;
 }
 
 void SetScreenDistance(float metres) {
-    if (!g_ctx) {
-        return;
-    }
+    LoadSettings();
     metres = std::clamp(metres, 0.5f, 15.0f);
     const float delta = metres - g_screenDistance;
     g_screenDistance = metres;
-    // Move along the screen's own local +Z (backwards, away from the viewer).
-    float back[3];
-    RotateByQuat(g_ctx->screenPose.orientation, 0, 0, 1, back);
-    g_ctx->screenPose.position.x += back[0] * delta;
-    g_ctx->screenPose.position.y += back[1] * delta;
-    g_ctx->screenPose.position.z += back[2] * delta;
+    CVarSetFloat(kCvarScreenDistance, metres);
+    if (g_ctx) {
+        // Move along the screen's own local +Z (backwards, away from the viewer).
+        float back[3];
+        RotateByQuat(g_ctx->screenPose.orientation, 0, 0, 1, back);
+        g_ctx->screenPose.position.x += back[0] * delta;
+        g_ctx->screenPose.position.y += back[1] * delta;
+        g_ctx->screenPose.position.z += back[2] * delta;
+    }
 }
 
 float GetStereoStrength() {
+    LoadSettings();
     return g_stereoStrength;
 }
 void SetStereoStrength(float strength) {
+    LoadSettings();
     g_stereoStrength = std::clamp(strength, 0.0f, 20.0f);
+    CVarSetFloat(kCvarStereoStrength, g_stereoStrength);
 }
 
 void PollHotkeys() {
@@ -1497,7 +1669,7 @@ void PollHotkeys() {
         return;
     }
     if (KeyEdge('V')) {
-        g_enabled = !g_enabled;
+        SetEnabled(!g_enabled);
         SPDLOG_INFO("[VR] VR rendering {}.", g_enabled ? "enabled" : "disabled");
     }
     if (KeyEdge('R')) {
@@ -1536,12 +1708,11 @@ bool RenderGameFrame(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtxRep
         return false;
     }
 
-    // Take over the frame only when the runtime is presenting our session
-    // (VISIBLE or FOCUSED). Otherwise let the normal desktop path run.
-    const bool visible = VrDebugEnabled()
-                             ? g_ctx->sessionRunning
-                             : (g_ctx->sessionState == XR_SESSION_STATE_FOCUSED ||
-                                g_ctx->sessionState == XR_SESSION_STATE_VISIBLE);
+    // Render whenever the session is running (and we are not backing off from a
+    // stalled runtime). Some runtimes (SteamVR) only promote the app out of READY
+    // once it starts submitting frames, so waiting for VISIBLE/FOCUSED before
+    // rendering deadlocks startup. Rendering early is cheap.
+    const bool visible = VrActive();
     static bool lastVisible = false;
     if (visible != lastVisible) {
         SPDLOG_INFO("[VR] render-active={} (state {})", visible, (int)g_ctx->sessionState);
@@ -1568,9 +1739,11 @@ bool RenderGameFrame(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtxRep
     }
 
     // StartDraw sets mCurDimensions from the window; size the eye targets to match.
+    const double t0 = NowMs();
     gui->StartDraw();
     EnsureRenderTargets(g_ctx, interp);
     PrepareOffscreen(interp);
+    const double tPrep = NowMs();
 
     const float half = g_stereoStrength * 0.5f;
     // Snapshot the camera matrices once so both eyes share an identical base.
@@ -1579,7 +1752,9 @@ bool RenderGameFrame(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtxRep
     // Render right first, left last, so the desktop mirror (which reads the last
     // mGfxFrameBuffer) shows the left eye.
     RenderEyeToTex(interp, g_ctx, 1, commands, base, +half);
+    const double tEye1 = NowMs();
     RenderEyeToTex(interp, g_ctx, 0, commands, base, -half);
+    const double tEye0 = NowMs();
 
     // Our blitter leaves an intermediate texture bound; ImGui's DX11 backend does
     // not set its own render target, so rebind the backbuffer before the GUI draw.
@@ -1591,12 +1766,41 @@ bool RenderGameFrame(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtxRep
                     g_ctx->renderHeight, g_ctx->eyes[0].width, g_ctx->eyes[0].height);
     }
 
-    // Present the desktop mirror (once per game frame; the headset is fed
+   // Present the desktop mirror (once per game frame; the headset is fed
     // separately by PresentFrame at the display rate).
     gui->EndDraw();
-    interp->EndFrame();
+    const double tGui = NowMs();
+    // The desktop present is only a spectator mirror, but its built-in frame
+    // limiter (gfx_dxgi SwapBuffersBegin) blocks ~12 ms per game frame to hit the
+    // window's target FPS, which starves the headset loop and pins it to the game
+    // rate. Present it only every Nth game frame (the limiter has long elapsed by
+    // then, so it is nearly free) and use the cheap path otherwise.
+    // PAPERBOAT_VR_MIRROR=N sets the period (1 = every frame); 0 disables it.
+    static const int s_mirrorPeriod = [] {
+        const char* v = std::getenv("PAPERBOAT_VR_MIRROR");
+        return v == nullptr ? 2 : std::max(0, std::atoi(v));
+    }();
+    static int s_mirrorCounter = 0;
+    if (s_mirrorPeriod > 0 && (++s_mirrorCounter % s_mirrorPeriod) == 0) {
+        interp->EndFrame();
+    } else {
+        auto* rapi = interp->GetCurrentRenderingAPI();
+        rapi->EndFrame();
+        rapi->FinishRender();
+    }
+    const double tEnd = NowMs();
 
     g_ctx->haveContent = true;
+
+    g_perf.prepMs += tPrep - t0;
+    g_perf.eye1Ms += tEye1 - tPrep;
+    g_perf.eye0Ms += tEye0 - tEye1;
+    g_perf.guiMs += tGui - tEye0;
+    g_perf.deskMs += tEnd - tGui;
+    const double rt = tEnd - t0;
+    g_perf.renderMs += rt;
+    g_perf.renderMax = std::max(g_perf.renderMax, rt);
+    ++g_perf.renders;
     return true;
 }
 
@@ -1611,35 +1815,72 @@ void PresentFrame() {
     if (!g_ctx->sessionRunning) {
         return;
     }
+    // If we backed off from a stalled runtime, only retry occasionally.
+    if (g_pumpPaused) {
+        if (NowMs() < g_pumpRetryAtMs) {
+            return;
+        }
+        g_pumpPaused = false; // retry now
+    }
     const bool visible = VrDebugEnabled()
                              ? true
                              : (g_ctx->sessionState == XR_SESSION_STATE_FOCUSED ||
                                 g_ctx->sessionState == XR_SESSION_STATE_VISIBLE);
-    if (!visible) {
-        return;
-    }
+    // NOTE: do NOT gate the frame loop on `visible`. The runtime only advances
+    // the session state (READY -> SYNCHRONIZED -> VISIBLE -> FOCUSED) while the
+    // app is driving xrWaitFrame/xrEndFrame; if we waited for VISIBLE before
+    // pumping, the session would stall at READY forever (and SteamVR would sit on
+    // its "launching" overlay). So pump from READY onward regardless of focus.
+
+    const double t0 = NowMs();
     if (!g_ctx->BeginFrame()) {
+        ++g_perf.beginFail;
         return;
     }
-    if (g_ctx->haveContent) {
+    const double t1 = NowMs();
+
+    static int s_lastShould = -1;
+    if ((int)g_ctx->frameState.shouldRender != s_lastShould) {
+        s_lastShould = (int)g_ctx->frameState.shouldRender;
+        SPDLOG_INFO("[VR] shouldRender={} (state {} visible={})", (bool)g_ctx->frameState.shouldRender,
+                    (int)g_ctx->sessionState, visible);
+    }
+
+    // Always (re)submit the most recent game render: it is a cached texture and
+    // the copy is cheap, so the headset never shows stale content even when the
+    // runtime sets shouldRender=false.
+    const bool submit = g_ctx->haveContent;
+    if (submit) {
         BlitEyeTexToSwapchain(g_ctx, 0);
         BlitEyeTexToSwapchain(g_ctx, 1);
     }
-    g_ctx->EndFrame(true);
-}
+    const double t2 = NowMs();
 
-void RenderIdleFrame() {
-    if (!g_enabled || g_ctx == nullptr || !g_ctx->initialized) {
-        return;
+    g_ctx->EndFrame(submit);
+    const double t3 = NowMs();
+
+    // Watchdog: a single frame that took pathologically long means the runtime
+    // stopped presenting (headset asleep / link dropped). Back off so the game
+    // keeps running on the desktop instead of stalling every frame.
+    if (t3 - t0 > 250.0) {
+        PausePump("frame took too long");
+    } else if (g_ctx->eyes[0].handle != XR_NULL_HANDLE && g_ctx->eyes[1].handle != XR_NULL_HANDLE &&
+               !g_ctx->eyeValid[0] && !g_ctx->eyeValid[1]) {
+        // Even xrBeginFrame succeeded, the swapchains were never handed over.
+        PausePump("swapchain images unavailable");
     }
-    g_ctx->PollEvents();
-    if (!g_ctx->sessionRunning) {
-        return;
+
+    g_perf.waitMs += t1 - t0;
+    g_perf.blitMs += t2 - t1;
+    g_perf.endMs += t3 - t2;
+    g_perf.waitMax = std::max(g_perf.waitMax, t1 - t0);
+    g_perf.blitMax = std::max(g_perf.blitMax, t2 - t1);
+    g_perf.endMax = std::max(g_perf.endMax, t3 - t2);
+    ++g_perf.present;
+    if (g_ctx->frameState.shouldRender) {
+        ++g_perf.shouldRender;
     }
-    if (!g_ctx->BeginFrame()) {
-        return;
-    }
-    g_ctx->EndFrame(true);
+    LogPerfIfNeeded("scene");
 }
 
 } // namespace Paperboat::VR
@@ -1654,6 +1895,7 @@ void Shutdown() {}
 bool IsSessionRunning() {
     return false;
 }
+void PollEvents() {}
 bool GetEnabled() {
     return false;
 }
@@ -1668,7 +1910,6 @@ void UpdateResolutionCap(Fast::Interpreter*) {}
 bool RenderGameFrame(Gfx*, const std::unordered_map<Mtx*, MtxF>&) {
     return false;
 }
-void RenderIdleFrame() {}
 void PresentFrame() {}
 void PollHotkeys() {}
 void Recenter() {}

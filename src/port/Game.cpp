@@ -146,6 +146,7 @@ extern "C"
 
     while (wnd->IsRunning()) {
         ThreadWatchdog_Beat(WATCHDOG_MAIN_LOOP);
+        Paperboat::VR::PollEvents();
         Paperboat::VR::PollHotkeys();
         GameEngine::Instance->StartFrame();
         OS_SiService();
