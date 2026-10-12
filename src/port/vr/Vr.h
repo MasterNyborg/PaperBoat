@@ -82,4 +82,8 @@ void SetScreenDistance(float metres);
 float GetStereoStrength();        // half-IPD in game world units
 void SetStereoStrength(float strength);
 
+// Re-reads the persisted settings (gVR.* CVars) and applies them live. The
+// settings menu widgets write the CVars directly and call this.
+void ReloadSettings();
+
 } // namespace Paperboat::VR

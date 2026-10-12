@@ -501,14 +501,12 @@ void PaperboatMenu::AddMenuSettings() {
     path.column = SECTION_COLUMN_1;
     AddSidebarEntry("Settings", "VR", 1);
     AddWidget(path, "VR Options", WIDGET_SEPARATOR_TEXT);
-    static bool vrEnabled = Paperboat::VR::GetEnabled();
-    static float vrScreenSize = Paperboat::VR::GetScreenSize();
-    static float vrScreenDistance = Paperboat::VR::GetScreenDistance();
-    static float vrStereo = Paperboat::VR::GetStereoStrength();
-    AddWidget(path, "Enable VR", WIDGET_CHECKBOX)
-        .ValuePointer(&vrEnabled)
+    // Bound directly to CVars (no local state) so the widget and the persisted
+    // value can never disagree; the callback re-applies it to the live session.
+    AddWidget(path, "Enable VR", WIDGET_CVAR_CHECKBOX)
+        .CVar("gVR.Enabled")
         .RaceDisable(false)
-        .Callback([](WidgetInfo&) { Paperboat::VR::SetEnabled(vrEnabled); })
+        .Callback([](WidgetInfo&) { Paperboat::VR::ReloadSettings(); })
         .Options(
             CheckboxOptions().Tooltip(
                 "Renders the game to a world-locked stereoscopic screen in the headset. "
@@ -519,10 +517,10 @@ void PaperboatMenu::AddMenuSettings() {
         .RaceDisable(false)
         .Callback([](WidgetInfo&) { Paperboat::VR::Recenter(); })
         .Options(ButtonOptions().Tooltip("Places the virtual screen in front of where you are looking."));
-    AddWidget(path, "Screen Size (m)", WIDGET_SLIDER_FLOAT)
-        .ValuePointer(&vrScreenSize)
+    AddWidget(path, "Screen Size (m)", WIDGET_CVAR_SLIDER_FLOAT)
+        .CVar("gVR.ScreenSize")
         .RaceDisable(false)
-        .Callback([](WidgetInfo&) { Paperboat::VR::SetScreenSize(vrScreenSize); })
+        .Callback([](WidgetInfo&) { Paperboat::VR::ReloadSettings(); })
         .Options(
             FloatSliderOptions()
                 .Tooltip("Width of the virtual screen, in metres.")
@@ -532,10 +530,10 @@ void PaperboatMenu::AddMenuSettings() {
                 .Max(12.0f)
                 .DefaultValue(1.6f)
         );
-    AddWidget(path, "Screen Distance (m)", WIDGET_SLIDER_FLOAT)
-        .ValuePointer(&vrScreenDistance)
+    AddWidget(path, "Screen Distance (m)", WIDGET_CVAR_SLIDER_FLOAT)
+        .CVar("gVR.ScreenDistance")
         .RaceDisable(false)
-        .Callback([](WidgetInfo&) { Paperboat::VR::SetScreenDistance(vrScreenDistance); })
+        .Callback([](WidgetInfo&) { Paperboat::VR::ReloadSettings(); })
         .Options(
             FloatSliderOptions()
                 .Tooltip("How far in front of your eyes the screen sits, in metres.")
@@ -545,10 +543,10 @@ void PaperboatMenu::AddMenuSettings() {
                 .Max(15.0f)
                 .DefaultValue(2.0f)
         );
-    AddWidget(path, "3D Strength", WIDGET_SLIDER_FLOAT)
-        .ValuePointer(&vrStereo)
+    AddWidget(path, "3D Strength", WIDGET_CVAR_SLIDER_FLOAT)
+        .CVar("gVR.StereoStrength")
         .RaceDisable(false)
-        .Callback([](WidgetInfo&) { Paperboat::VR::SetStereoStrength(vrStereo); })
+        .Callback([](WidgetInfo&) { Paperboat::VR::ReloadSettings(); })
         .Options(
             FloatSliderOptions()
                 .Tooltip("Eye separation; controls how deep the 3D looks. 0 = flat (mono).")
@@ -556,7 +554,7 @@ void PaperboatMenu::AddMenuSettings() {
                 .Step(0.25f)
                 .Min(0.0f)
                 .Max(20.0f)
-                .DefaultValue(2.0f)
+                .DefaultValue(3.0f)
         );
 
     // Notifications

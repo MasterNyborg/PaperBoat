@@ -3,8 +3,11 @@
 #include <libultraship.h>
 
 #include <chrono>
+#include <exception>
 #include <mutex>
 #include <unordered_map>
+
+#include <spdlog/spdlog.h>
 
 #include "Engine.h"
 #include "port/DevTools/ThreadWatchdog.h"
@@ -145,36 +148,46 @@ extern "C"
     Graphics_Start();
 
     while (wnd->IsRunning()) {
-        ThreadWatchdog_Beat(WATCHDOG_MAIN_LOOP);
-        Paperboat::VR::PollEvents();
-        Paperboat::VR::PollHotkeys();
-        GameEngine::Instance->StartFrame();
-        OS_SiService();
-        GameEngine::DrainRenderService();
-        const bool hadTask = ServiceRcp() != 0;
+        // A lost D3D device (DXGI_ERROR_DEVICE_REMOVED, e.g. a GPU/display switch
+        // or driver reset when an overlay like Virtual Desktop takes over) makes
+        // every GPU call fail and the renderer throws Ship::HResultException. It
+        // cannot be recovered in-process, so catch it and shut down cleanly
+        // instead of hard-crashing.
+        try {
+            ThreadWatchdog_Beat(WATCHDOG_MAIN_LOOP);
+            Paperboat::VR::PollEvents();
+            Paperboat::VR::PollHotkeys();
+            GameEngine::Instance->StartFrame();
+            OS_SiService();
+            GameEngine::DrainRenderService();
+            const bool hadTask = ServiceRcp() != 0;
 
-        if (!hadTask && ThreadWatchdog_IsStalled(WATCHDOG_GAME_TICK)) {
-            GameEngine::Instance->RenderGuiFrame();
-            SDL_Delay(16);
-        }
+            if (!hadTask && ThreadWatchdog_IsStalled(WATCHDOG_GAME_TICK)) {
+                GameEngine::Instance->RenderGuiFrame();
+                SDL_Delay(16);
+            }
 
-        // Deliver one frame to the headset every iteration (display-rate,
-        // in-order delivery), reusing the latest game render if there was no
-        // new task this iteration.
-        if (Paperboat::VR::IsSessionRunning()) {
-            Paperboat::VR::PresentFrame();
-        } else if (!hadTask) {
-            SDL_Delay(1);
-        }
+            // Deliver one frame to the headset every iteration (display-rate,
+            // in-order delivery), reusing the latest game render if there was no
+            // new task this iteration.
+            if (Paperboat::VR::IsSessionRunning()) {
+                Paperboat::VR::PresentFrame();
+            } else if (!hadTask) {
+                SDL_Delay(1);
+            }
 #ifdef __EMSCRIPTEN__
-        // A tab can close without warning, so sync periodically, not just on exit.
-        static uint32_t lastSync = 0;
-        const uint32_t now = SDL_GetTicks();
-        if (now - lastSync > 5000) {
-            lastSync = now;
-            WebCache_Save();
-        }
+            // A tab can close without warning, so sync periodically, not just on exit.
+            static uint32_t lastSync = 0;
+            const uint32_t now = SDL_GetTicks();
+            if (now - lastSync > 5000) {
+                lastSync = now;
+                WebCache_Save();
+            }
 #endif
+        } catch (const std::exception& e) {
+            SPDLOG_CRITICAL("Fatal error in main loop (shutting down): {}", e.what());
+            break;
+        }
     }
 
     OS_RequestThreadExit();

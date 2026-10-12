@@ -50,6 +50,7 @@
 #include <fast/backends/gfx_direct3d_common.h>
 #include <fast/interpreter.h>
 #include <ship/Context.h>
+#include <ship/config/ConsoleVariable.h>
 #include <ship/window/Window.h>
 #include <ship/window/gui/Gui.h>
 
@@ -59,11 +60,14 @@
 #include "port/interpolation/FrameInterpolation.h"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -261,6 +265,12 @@ class Context {
 
     void PollEvents();
 
+    // Syncs controller state without starting an XR frame (used while the pump is
+    // paused so VR buttons/stick keep working instead of freezing).
+    void SyncInput() {
+        SyncActions();
+    }
+
     XrSession session = XR_NULL_HANDLE;
     XrInstance instance = XR_NULL_HANDLE;
     XrSystemId systemId = XR_NULL_SYSTEM_ID;
@@ -302,6 +312,11 @@ class Context {
     ComPtr<ID3D11ShaderResourceView> eyeSrv[2];
     XrPosef screenPose{ { 0, 0, 0, 1 }, { 0, 0, -kDefaultScreenDistance } };
     XrExtent2Df screenSize{ kDefaultScreenSize, kDefaultScreenSize * 0.75f };
+    // The screen sits on the ray (anchor + dir * distance), captured at recenter.
+    // Using the stored anchor (rather than a live head pose) means the distance
+    // control always moves the screen deterministically.
+    XrVector3f screenAnchor{ 0.0f, 0.0f, 0.0f };
+    XrVector3f screenDir{ 0.0f, 0.0f, -1.0f };
 
     bool CreateSwapchains(uint32_t width, uint32_t height);
     void CreateEyeTextures(uint32_t width, uint32_t height);
@@ -344,6 +359,16 @@ float g_stereoStrength = kDefaultStereoStrength;
 // itself blocks in xrWaitFrame for as long as the runtime is throttling.
 bool g_pumpPaused = false;
 
+// Watchdog: the OpenXR frame pump runs on the main thread (the same thread that
+// polls input and runs the game loop). If a blocking XR call hangs -- e.g. the
+// headset/link stalls while the runtime keeps the session "focused" -- the whole
+// loop freezes and the last input stays latched (Mario walks forever). Watch the
+// main-loop heartbeat from a helper thread and ask the runtime to end the
+// session, which releases the blocked call so the game falls back to the desktop.
+std::atomic<double> g_mainLoopBeatMs{ 0.0 };
+std::atomic<bool> g_stopWatchdog{ false };
+std::thread g_watchdogThread;
+
 // ---------------------------------------------------------------------------
 // Temporary frame-timing instrumentation (removed once pacing is verified).
 // ---------------------------------------------------------------------------
@@ -380,6 +405,48 @@ void ResumePumpIfPaused() {
         g_pumpPaused = false;
         SPDLOG_INFO("[VR] Session state changed; resuming headset submission.");
     }
+}
+
+// --- main-loop stall watchdog ------------------------------------------------
+void WatchdogThreadMain() {
+    constexpr double kStallMs = 10000.0;
+    while (!g_stopWatchdog.load(std::memory_order_relaxed)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        const double beat = g_mainLoopBeatMs.load(std::memory_order_relaxed);
+        if (beat <= 0.0) {
+            continue;
+        }
+        const double now = NowMs();
+        if (now - beat > kStallMs) {
+            if (g_ctx != nullptr && g_ctx->sessionRunning && g_ctx->session != XR_NULL_HANDLE) {
+                SPDLOG_WARN("[VR] Main loop stalled {:.1f}s; requesting session exit to recover.",
+                            (now - beat) / 1000.0);
+                xrRequestExitSession(g_ctx->session);
+            } else {
+                SPDLOG_WARN("[VR] Main loop stalled {:.1f}s.", (now - beat) / 1000.0);
+            }
+            g_mainLoopBeatMs.store(now, std::memory_order_relaxed); // don't spam
+        }
+    }
+}
+
+void StartWatchdog() {
+    if (g_watchdogThread.joinable()) {
+        return;
+    }
+    g_stopWatchdog.store(false, std::memory_order_relaxed);
+    g_watchdogThread = std::thread(WatchdogThreadMain);
+}
+
+void StopWatchdog() {
+    g_stopWatchdog.store(true, std::memory_order_relaxed);
+    if (g_watchdogThread.joinable()) {
+        g_watchdogThread.join();
+    }
+}
+
+void BeatMainLoop() {
+    g_mainLoopBeatMs.store(NowMs(), std::memory_order_relaxed);
 }
 
 void LogPerfIfNeeded(const char* phase) {
@@ -1423,6 +1490,8 @@ bool TryRecenter() {
     hz /= len;
 
     const float dist = GetScreenDistance();
+    g_ctx->screenAnchor = { loc.pose.position.x, loc.pose.position.y, loc.pose.position.z };
+    g_ctx->screenDir = { hx, 0.0f, hz };
     XrPosef pose{};
     pose.position.x = loc.pose.position.x + hx * dist;
     pose.position.y = loc.pose.position.y;
@@ -1446,6 +1515,33 @@ constexpr const char* kCvarScreenSize = "gVR.ScreenSize";
 constexpr const char* kCvarScreenDistance = "gVR.ScreenDistance";
 constexpr const char* kCvarStereoStrength = "gVR.StereoStrength";
 
+// Reads a float CVar in a type-tolerant way. The port's CVarGetFloat returns the
+// DEFAULT whenever the stored value's type isn't Float -- which happens when a
+// whole-number float (e.g. 8.0) gets serialised as a JSON integer and reloaded as
+// an Integer CVar. Reading the raw entry avoids silently dropping the user's
+// saved value (which made the screen always render at the default distance).
+float CvarFloat(const char* name, float fallback) {
+    auto ship = Ship::Context::GetRawInstance();
+    if (ship == nullptr) {
+        return fallback;
+    }
+    auto cvars = ship->GetConsoleVariables();
+    if (cvars == nullptr) {
+        return fallback;
+    }
+    auto var = cvars->Get(name);
+    if (var == nullptr) {
+        return fallback;
+    }
+    if (var->Type == Ship::ConsoleVariableType::Float) {
+        return var->Float;
+    }
+    if (var->Type == Ship::ConsoleVariableType::Integer) {
+        return (float)var->Integer;
+    }
+    return fallback;
+}
+
 // Loads persisted settings into the module globals. Lazy + idempotent so it
 // works no matter whether the settings menu is built before or after the OpenXR
 // session is created (and even when there is no runtime/headset at all).
@@ -1456,9 +1552,9 @@ void LoadSettings() {
     }
     loaded = true;
     g_enabled = CVarGetInteger(kCvarEnabled, 1) != 0;
-    g_screenWidth = CVarGetFloat(kCvarScreenSize, kDefaultScreenSize);
-    g_screenDistance = CVarGetFloat(kCvarScreenDistance, kDefaultScreenDistance);
-    g_stereoStrength = CVarGetFloat(kCvarStereoStrength, kDefaultStereoStrength);
+    g_screenWidth = CvarFloat(kCvarScreenSize, kDefaultScreenSize);
+    g_screenDistance = CvarFloat(kCvarScreenDistance, kDefaultScreenDistance);
+    g_stereoStrength = CvarFloat(kCvarStereoStrength, kDefaultStereoStrength);
     SPDLOG_INFO("[VR] Settings loaded: enabled={} screenSize={:.2f}m distance={:.2f}m stereo={:.2f}", g_enabled,
                 g_screenWidth, g_screenDistance, g_stereoStrength);
 }
@@ -1479,6 +1575,7 @@ void ApplySettingsToContext() {
 // ---------------------------------------------------------------------------
 bool Initialize() {
     LoadSettings();
+    StartWatchdog();
     if (g_ctx != nullptr && g_ctx->initialized) {
         return true;
     }
@@ -1496,6 +1593,7 @@ bool Initialize() {
 }
 
 void Shutdown() {
+    StopWatchdog();
     if (g_ctx != nullptr) {
         g_ctx->Shutdown();
         delete g_ctx;
@@ -1508,10 +1606,16 @@ bool IsSessionRunning() {
 }
 
 void PollEvents() {
+    BeatMainLoop();
     if (g_ctx == nullptr) {
         return;
     }
     g_ctx->PollEvents();
+    // Keep VR-controller input live even while the pump is paused for a stall,
+    // otherwise the actions stop syncing and the last value stays latched.
+    if (g_pumpPaused) {
+        g_ctx->SyncInput();
+    }
     // The runtime told us it is exiting (SteamVR quit / HMD link dropped for
     // good): tear the OpenXR objects down immediately. Leaving a half-dead
     // session around while the runtime unloads makes the loader/runtime fall over
@@ -1638,20 +1742,56 @@ float GetScreenDistance() {
     return g_screenDistance;
 }
 
+// Places the screen `g_screenDistance` along the anchored ray captured at the
+// last recenter. Deterministic and independent of live tracking, so the distance
+// control always moves the screen and a given value always lands in the same
+// place (consistent with the recenter, which also puts it anchor + dir * dist).
+void ApplyDistance() {
+    if (g_ctx == nullptr) {
+        return;
+    }
+    const float d = g_screenDistance;
+    g_ctx->screenPose.position.x = g_ctx->screenAnchor.x + g_ctx->screenDir.x * d;
+    g_ctx->screenPose.position.y = g_ctx->screenAnchor.y + g_ctx->screenDir.y * d;
+    g_ctx->screenPose.position.z = g_ctx->screenAnchor.z + g_ctx->screenDir.z * d;
+}
+
 void SetScreenDistance(float metres) {
     LoadSettings();
     metres = std::clamp(metres, 0.5f, 15.0f);
-    const float delta = metres - g_screenDistance;
     g_screenDistance = metres;
     CVarSetFloat(kCvarScreenDistance, metres);
-    if (g_ctx) {
-        // Move along the screen's own local +Z (backwards, away from the viewer).
-        float back[3];
-        RotateByQuat(g_ctx->screenPose.orientation, 0, 0, 1, back);
-        g_ctx->screenPose.position.x += back[0] * delta;
-        g_ctx->screenPose.position.y += back[1] * delta;
-        g_ctx->screenPose.position.z += back[2] * delta;
+    ApplyDistance();
+}
+
+// Re-reads the persisted VR settings from their CVars and applies them live.
+// Called by the settings menu (whose widgets write the CVars directly), so the
+// UI and the running session can never disagree.
+void ReloadSettings() {
+    if (Ship::Context::GetRawInstance() == nullptr) {
+        return;
     }
+    const bool enabled = CVarGetInteger(kCvarEnabled, 1) != 0;
+    const float size = CvarFloat(kCvarScreenSize, kDefaultScreenSize);
+    const float dist = CvarFloat(kCvarScreenDistance, kDefaultScreenDistance);
+    const float stereo = CvarFloat(kCvarStereoStrength, kDefaultStereoStrength);
+    // The settings menu fires its callback every frame, so only apply (and log)
+    // when something actually changed.
+    if (enabled == g_enabled && size == g_screenWidth && dist == g_screenDistance && stereo == g_stereoStrength) {
+        return;
+    }
+    g_enabled = enabled;
+    g_screenWidth = size;
+    g_screenDistance = dist;
+    g_stereoStrength = stereo;
+    if (g_ctx != nullptr) {
+        const float aspect = g_ctx->renderWidth > 0 ? (float)g_ctx->renderHeight / (float)g_ctx->renderWidth : 0.75f;
+        g_ctx->screenSize.width = g_screenWidth;
+        g_ctx->screenSize.height = g_screenWidth * aspect;
+        ApplyDistance();
+    }
+    SPDLOG_INFO("[VR] ReloadSettings: enabled={} size={:.2f} dist={:.2f} stereo={:.2f}", g_enabled, g_screenWidth,
+                g_screenDistance, g_stereoStrength);
 }
 
 float GetStereoStrength() {
@@ -1775,10 +1915,14 @@ bool RenderGameFrame(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtxRep
     // window's target FPS, which starves the headset loop and pins it to the game
     // rate. Present it only every Nth game frame (the limiter has long elapsed by
     // then, so it is nearly free) and use the cheap path otherwise.
-    // PAPERBOAT_VR_MIRROR=N sets the period (1 = every frame); 0 disables it.
+    // Only a spectator mirror. Its DXGI present is an extra GPU/display surface
+    // that does not exist in a normal VR app, and presenting a desktop swapchain
+    // while an overlay (e.g. Virtual Desktop) takes over the display is exactly
+    // the kind of thing that can trip a device removal. Default: OFF while VR is
+    // active (set PAPERBOAT_VR_MIRROR=N to re-enable, N = game frames per present).
     static const int s_mirrorPeriod = [] {
         const char* v = std::getenv("PAPERBOAT_VR_MIRROR");
-        return v == nullptr ? 2 : std::max(0, std::atoi(v));
+        return v == nullptr ? 0 : std::max(0, std::atoi(v));
     }();
     static int s_mirrorCounter = 0;
     if (s_mirrorPeriod > 0 && (++s_mirrorCounter % s_mirrorPeriod) == 0) {
@@ -1851,25 +1995,34 @@ void PresentFrame() {
     if (submit) {
         BlitEyeTexToSwapchain(g_ctx, 0);
         BlitEyeTexToSwapchain(g_ctx, 1);
+        // Submit the swapchain writes to the GPU *before* releasing the images /
+        // handing them to the compositor. The XR swapchains are cross-process
+        // shared textures, so if the drawing is still only queued the compositor's
+        // sync times out (SteamVR: "AcquireSync FAILED with WAIT_TIMEOUT") and the
+        // headset freezes even though the game keeps running.
+        g_ctx->DeviceContext()->Flush();
     }
     const double t2 = NowMs();
 
     g_ctx->EndFrame(submit);
     const double t3 = NowMs();
 
-    // Watchdog: a single frame that took pathologically long means the runtime
-    // stopped presenting (headset asleep / link dropped). Back off so the game
-    // keeps running on the desktop instead of stalling every frame. Only applies
-    // while the runtime is supposed to be presenting (VISIBLE/FOCUSED), so the
-    // startup ramp is never misdiagnosed as a stall.
+    // Watchdog: only back off when the runtime is *sustainedly* not presenting
+    // (headset asleep / link dropped) -- never on a one-off game hitch, which
+    // would otherwise freeze headset delivery and input mid-play. Require several
+    // consecutive pathologically long frames, and use the runtime's own predicted
+    // frame period as the signal (it reflects throttling, not our render cost).
     const bool presenting = g_ctx->sessionState == XR_SESSION_STATE_VISIBLE ||
                             g_ctx->sessionState == XR_SESSION_STATE_FOCUSED;
-    if (presenting && t3 - t0 > 250.0) {
-        PausePump("frame took too long");
-    } else if (presenting && g_ctx->eyes[0].handle != XR_NULL_HANDLE && g_ctx->eyes[1].handle != XR_NULL_HANDLE &&
-               !g_ctx->eyeValid[0] && !g_ctx->eyeValid[1]) {
-        // Even xrBeginFrame succeeded, the swapchains were never handed over.
-        PausePump("swapchain images unavailable");
+    const bool runtimeThrottled = g_ctx->frameState.predictedDisplayPeriod > 100 * 1000 * 1000; // < 10 Hz
+    static int s_stallFrames = 0;
+    if (presenting && runtimeThrottled) {
+        if (++s_stallFrames >= 3) { // a few consecutive throttled frames, not a hitch
+            PausePump("runtime stopped presenting (throttled)");
+            s_stallFrames = 0;
+        }
+    } else {
+        s_stallFrames = 0;
     }
 
     g_perf.waitMs += t1 - t0;
@@ -1927,6 +2080,7 @@ float GetStereoStrength() {
     return 0.0f;
 }
 void SetStereoStrength(float) {}
+void ReloadSettings() {}
 } // namespace Paperboat::VR
 
 #endif // PAPERBOAT_ENABLE_OPENXR
