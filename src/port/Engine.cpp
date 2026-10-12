@@ -1081,7 +1081,8 @@ void GameEngine::AudioExit() {
     }
 }
 
-void GameEngine::RunCommands(Gfx* Commands, const std::vector<std::unordered_map<Mtx*, MtxF>>& mtx_replacements) {
+void GameEngine::RunCommands(Gfx* Commands, Gfx* worldCommands, Gfx* uiCommands,
+                             const std::vector<std::unordered_map<Mtx*, MtxF>>& mtx_replacements) {
     auto wnd = std::dynamic_pointer_cast<Fast::Fast3dWindow>(Ship::Context::GetRawInstance()->GetWindow());
 
     if (wnd == nullptr) {
@@ -1131,7 +1132,8 @@ void GameEngine::RunCommands(Gfx* Commands, const std::vector<std::unordered_map
             continue;
         }
 
-        if (Paperboat::VR::GetEnabled() && Paperboat::VR::RenderGameFrame(Commands, mtx_replacements[i])) {
+        if (Paperboat::VR::GetEnabled() &&
+            Paperboat::VR::RenderGameFrame(worldCommands, uiCommands, mtx_replacements[i])) {
             OS_ViNotifyPresent();
             interpreter->mInterpolationIndex++;
             continue;
@@ -1142,7 +1144,7 @@ void GameEngine::RunCommands(Gfx* Commands, const std::vector<std::unordered_map
     }
 }
 
-void GameEngine::ProcessGfxCommands(Gfx* commands) {
+void GameEngine::ProcessGfxCommands(Gfx* commands, Gfx* worldCommands, Gfx* uiCommands) {
     auto wnd = std::dynamic_pointer_cast<Fast::Fast3dWindow>(Ship::Context::GetRawInstance()->GetWindow());
 
     if (wnd == nullptr)
@@ -1190,7 +1192,7 @@ void GameEngine::ProcessGfxCommands(Gfx* commands) {
         wnd->SetTargetFps(GetInterpolationFPS());
         wnd->SetMaximumFrameLatency(1);
     }
-    RunCommands(commands, mtx_replacements);
+    RunCommands(commands, worldCommands, uiCommands, mtx_replacements);
 
     last_fps = fps;
 }
@@ -1283,8 +1285,8 @@ extern "C" uint8_t GameEngine_OTRSigCheck(const char* data) {
 }
 
 // C-callable wrapper for processing graphics commands
-extern "C" void GameEngine_ProcessGfxCommands(Gfx* commands) {
-    GameEngine::ProcessGfxCommands(commands);
+extern "C" void GameEngine_ProcessGfxCommands(Gfx* commands, Gfx* worldCommands, Gfx* uiCommands) {
+    GameEngine::ProcessGfxCommands(commands, worldCommands, uiCommands);
 }
 
 // Renderer calls from tick code come through here

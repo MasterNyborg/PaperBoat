@@ -21,7 +21,9 @@ extern void nuScExecuteGraphics(void);
 extern void gfxThread(void* data);
 extern void nuGfxTaskMgr(void* data);
 
-static Gfx sMasterList[8];
+static Gfx sMasterList[12];
+static Gfx sWorldList[8];
+static Gfx sUiList[8];
 
 // audioRequestMQ stays non-blocking: nothing drains it.
 void Graphics_EnableNusysThreads(void) {
@@ -70,21 +72,42 @@ s32 Graphics_ShouldCapturePrevFrame(void) {
 }
 
 void Graphics_DrawFrame(Gfx* backgroundList, Gfx* mainList, s32 capturePrevFrame) {
-    Gfx* g = sMasterList;
+    // The UI list lives in the same DisplayContext as mainList (see main_loop.c:
+    // gfx_draw_frame writes the on-screen UI into DisplayContext::uiGfx).
+    Gfx* uiList = (Gfx*) ((char*) mainList - offsetof(DisplayContext, mainGfx) + offsetof(DisplayContext, uiGfx));
 
+    // World only (VR renders this per eye).
+    Gfx* w = sWorldList;
+    if (backgroundList != NULL) {
+        gSPDisplayList(w++, backgroundList);
+    }
+    gSPDisplayList(w++, mainList);
+    if (capturePrevFrame) {
+        port_emitPrevFrameCapture(&w);
+    }
+    gDPFullSync(w++);
+    gSPEndDisplayList(w++);
+
+    // UI only (VR renders this once to a flat layer in front of the 3D screen).
+    Gfx* u = sUiList;
+    gSPDisplayList(u++, uiList);
+    gDPFullSync(u++);
+    gSPEndDisplayList(u++);
+
+    // Combined world + UI (everything else, e.g. the desktop path).
+    Gfx* g = sMasterList;
     if (backgroundList != NULL) {
         gSPDisplayList(g++, backgroundList);
     }
     gSPDisplayList(g++, mainList);
-
+    gSPDisplayList(g++, uiList);
     if (capturePrevFrame) {
         port_emitPrevFrameCapture(&g);
     }
-
     gDPFullSync(g++);
     gSPEndDisplayList(g++);
 
-    GameEngine_ProcessGfxCommands(sMasterList);
+    GameEngine_ProcessGfxCommands(sMasterList, sWorldList, sUiList);
 }
 
 void Graphics_GetWatchdogState(NusysWatchdogState* out) {

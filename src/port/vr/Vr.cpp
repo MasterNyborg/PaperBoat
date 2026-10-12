@@ -93,6 +93,7 @@ constexpr uint32_t kEyeRenderWidth = 1280; // per-eye render width; height from 
 constexpr float kDefaultScreenSize = 1.6f; // metres, width
 constexpr float kDefaultScreenDistance = 2.0f;
 constexpr float kDefaultStereoStrength = 3.0f; // full IPD in game world units
+constexpr float kDefaultUiDistance = 0.35f;    // metres the UI quad floats in front of the screen
 constexpr float kMaxEyeRenderWidth = 1280.0f;  // per-eye render width cap
 constexpr float kScreenSizeStep = 0.1f;
 constexpr float kScreenDistanceStep = 0.1f;
@@ -151,15 +152,29 @@ class Blitter {
                                  "float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {\n"
                                  "  return tex.Sample(smp, uv);\n"
                                  "}";
+        // Keyed copy: the N64 RDP writes each sprite's own alpha, so an overlay's
+        // transparent texels both punch holes in, and (with a color key) show
+        // solid boxes for, the UI behind them. Derive the layer alpha as "the RDP
+        // alpha OR the color shows" on a transparent (black) clear: opaque
+        // wherever anything was drawn, transparent only where nothing was.
+        static const char* kPsKey = "Texture2D tex : register(t0);\n"
+                                    "SamplerState smp : register(s0);\n"
+                                    "float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {\n"
+                                    "  float4 c = tex.Sample(smp, uv);\n"
+                                    "  float a = (c.a > 0.004 || (c.r + c.g + c.b) > 0.004) ? 1.0 : 0.0;\n"
+                                    "  return float4(c.rgb, a);\n"
+                                    "}";
 
-        ComPtr<ID3DBlob> vsBlob, psBlob, err;
+        ComPtr<ID3DBlob> vsBlob, psBlob, keyBlob, err;
         if (FAILED(compile(kVs, strlen(kVs), nullptr, nullptr, nullptr, "main", "vs_5_0", 0, 0, &vsBlob, &err)) ||
-            FAILED(compile(kPs, strlen(kPs), nullptr, nullptr, nullptr, "main", "ps_5_0", 0, 0, &psBlob, &err))) {
+            FAILED(compile(kPs, strlen(kPs), nullptr, nullptr, nullptr, "main", "ps_5_0", 0, 0, &psBlob, &err)) ||
+            FAILED(compile(kPsKey, strlen(kPsKey), nullptr, nullptr, nullptr, "main", "ps_5_0", 0, 0, &keyBlob, &err))) {
             SPDLOG_WARN("[VR] Shader compilation failed; falling back to CopyResource.");
             return false;
         }
         if (FAILED(device->CreateVertexShader(vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), nullptr, &vs)) ||
-            FAILED(device->CreatePixelShader(psBlob->GetBufferPointer(), psBlob->GetBufferSize(), nullptr, &ps))) {
+            FAILED(device->CreatePixelShader(psBlob->GetBufferPointer(), psBlob->GetBufferSize(), nullptr, &ps)) ||
+            FAILED(device->CreatePixelShader(keyBlob->GetBufferPointer(), keyBlob->GetBufferSize(), nullptr, &psKey))) {
             return false;
         }
 
@@ -199,7 +214,7 @@ class Blitter {
     bool ready = false;
 
     void Blit(ID3D11Device* device, ID3D11DeviceContext* ctx, ID3D11ShaderResourceView* srv,
-              ID3D11Texture2D* dst, DXGI_FORMAT dstFormat, uint32_t dstW, uint32_t dstH) {
+              ID3D11Texture2D* dst, DXGI_FORMAT dstFormat, uint32_t dstW, uint32_t dstH, bool keyed = false) {
         if (!ready || !srv || !dst) {
             return;
         }
@@ -232,7 +247,7 @@ class Blitter {
         ctx->IASetInputLayout(nullptr);
         ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         ctx->VSSetShader(vs.Get(), nullptr, 0);
-        ctx->PSSetShader(ps.Get(), nullptr, 0);
+        ctx->PSSetShader(keyed ? psKey.Get() : ps.Get(), nullptr, 0);
         ctx->PSSetShaderResources(0, 1, &srv);
         ctx->PSSetSamplers(0, 1, sampler.GetAddressOf());
         ctx->Draw(3, 0);
@@ -246,6 +261,7 @@ class Blitter {
                                             LPCSTR, UINT, UINT, ID3DBlob**, ID3DBlob**);
     ComPtr<ID3D11VertexShader> vs;
     ComPtr<ID3D11PixelShader> ps;
+    ComPtr<ID3D11PixelShader> psKey;
     ComPtr<ID3D11SamplerState> sampler;
     ComPtr<ID3D11RasterizerState> raster;
     ComPtr<ID3D11DepthStencilState> depthOff;
@@ -305,11 +321,18 @@ class Context {
     float renderAspect = 0.0f; // captured once from the game camera viewport
     EyeSwapchain eyes[2];
     bool eyeValid[2] = { false, false }; // successfully acquired+waited this frame
+    // Mono on-screen UI layer: one texture shown to both eyes, floated in front of
+    // the 3D screen so it can never be occluded by (or clash with) scene depth.
+    EyeSwapchain uiSwap;
+    bool uiValid = false;
     Blitter blitter;
     // The game renders into these at its own rate; the presentation step copies
     // them into the XR swapchains at the headset rate (decoupled frame delivery).
     ComPtr<ID3D11Texture2D> eyeTex[2];
     ComPtr<ID3D11ShaderResourceView> eyeSrv[2];
+    ComPtr<ID3D11Texture2D> uiTex;
+    ComPtr<ID3D11ShaderResourceView> uiSrv;
+    bool haveUiContent = false;
     XrPosef screenPose{ { 0, 0, 0, 1 }, { 0, 0, -kDefaultScreenDistance } };
     XrExtent2Df screenSize{ kDefaultScreenSize, kDefaultScreenSize * 0.75f };
     // The screen sits on the ray (anchor + dir * distance), captured at recenter.
@@ -333,8 +356,8 @@ class Context {
     bool CreateActions();
     void SyncActions();
     void DestroySwapchains();
-    void AcquireEye(int eye);
-    void ReleaseEye(int eye);
+    void AcquireSwap(EyeSwapchain& sc, bool& valid);
+    void ReleaseSwap(EyeSwapchain& sc);
     void SubmitLayers(bool submitContent);
 
     ID3D11Device* device = nullptr;
@@ -350,6 +373,7 @@ bool g_enabled = true;
 float g_screenWidth = kDefaultScreenSize; // metres
 float g_screenDistance = kDefaultScreenDistance;
 float g_stereoStrength = kDefaultStereoStrength;
+float g_uiDistance = kDefaultUiDistance; // metres the UI quad floats in front of the screen
 
 // Watchdog for a runtime that stopped presenting (headset asleep/disconnected).
 // If an XR frame takes pathologically long, or the swapchains stop being handed
@@ -901,15 +925,13 @@ bool Context::CreateSwapchains(uint32_t width, uint32_t height) {
                     chosenFormat);
     }
 
-    for (int e = 0; e < 2; ++e) {
-        EyeSwapchain& sc = eyes[e];
+    auto makeSwap = [&](EyeSwapchain& sc) -> bool {
         sc.width = width;
         sc.height = height;
         sc.format = chosenFormat;
 
         XrSwapchainCreateInfo sci{ XR_TYPE_SWAPCHAIN_CREATE_INFO };
-        sci.usageFlags =
-            XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+        sci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
         sci.format = chosenFormat;
         sci.sampleCount = 1;
         sci.width = width;
@@ -931,6 +953,17 @@ bool Context::CreateSwapchains(uint32_t width, uint32_t height) {
                    "xrEnumerateSwapchainImages")) {
             return false;
         }
+        return true;
+    };
+
+    for (int e = 0; e < 2; ++e) {
+        if (!makeSwap(eyes[e])) {
+            return false;
+        }
+    }
+    // The UI layer is a single (mono) swapchain shown to both eyes.
+    if (!makeSwap(uiSwap)) {
+        return false;
     }
 
     renderWidth = width;
@@ -940,15 +973,15 @@ bool Context::CreateSwapchains(uint32_t width, uint32_t height) {
     return true;
 }
 
-// Intermediate eye targets the game renders into. The presentation step copies
+// Intermediate eye/UI targets the game renders into. The presentation step copies
 // these into the XR swapchains, decoupling the game's render rate from the
 // headset's frame rate.
 void Context::CreateEyeTextures(uint32_t width, uint32_t height) {
-    for (int e = 0; e < 2; ++e) {
-        eyeSrv[e].Reset();
-        eyeTex[e].Reset();
+    auto makeTex = [&](ComPtr<ID3D11Texture2D>& tex, ComPtr<ID3D11ShaderResourceView>& srv) {
+        tex.Reset();
+        srv.Reset();
         if (!device) {
-            continue;
+            return;
         }
         D3D11_TEXTURE2D_DESC desc{};
         desc.Width = width;
@@ -958,11 +991,17 @@ void Context::CreateEyeTextures(uint32_t width, uint32_t height) {
         desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM; // matches the game framebuffer
         desc.SampleDesc.Count = 1;
         desc.Usage = D3D11_USAGE_DEFAULT;
-        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        if (SUCCEEDED(device->CreateTexture2D(&desc, nullptr, eyeTex[e].GetAddressOf()))) {
-            device->CreateShaderResourceView(eyeTex[e].Get(), nullptr, eyeSrv[e].GetAddressOf());
+        // RENDER_TARGET so the blitter can draw into it (the UI copy runs a
+        // chroma-key pixel shader, which needs an RTV).
+        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+        if (SUCCEEDED(device->CreateTexture2D(&desc, nullptr, tex.GetAddressOf()))) {
+            device->CreateShaderResourceView(tex.Get(), nullptr, srv.GetAddressOf());
         }
+    };
+    for (int e = 0; e < 2; ++e) {
+        makeTex(eyeTex[e], eyeSrv[e]);
     }
+    makeTex(uiTex, uiSrv);
 }
 
 void Context::DestroySwapchains() {
@@ -974,6 +1013,12 @@ void Context::DestroySwapchains() {
         }
         sc.acquired = false;
     }
+    uiSwap.images.clear();
+    if (uiSwap.handle != XR_NULL_HANDLE) {
+        xrDestroySwapchain(uiSwap.handle);
+        uiSwap.handle = XR_NULL_HANDLE;
+    }
+    uiSwap.acquired = false;
 }
 
 bool Context::Initialize() {
@@ -1121,9 +1166,8 @@ void Context::PollEvents() {
     }
 }
 
-void Context::AcquireEye(int e) {
-    EyeSwapchain& sc = eyes[e];
-    eyeValid[e] = false;
+void Context::AcquireSwap(EyeSwapchain& sc, bool& valid) {
+    valid = false;
     if (sc.handle == XR_NULL_HANDLE || sc.acquired) {
         return;
     }
@@ -1131,31 +1175,26 @@ void Context::AcquireEye(int e) {
     if (Failed(xrAcquireSwapchainImage(sc.handle, &ai, &sc.acquiredIndex), "xrAcquireSwapchainImage")) {
         return;
     }
-    // A finite timeout: if the runtime can't hand over the image in time (e.g.
-    // the compositor stopped consuming because the headset went to sleep), give
-    // up on this eye instead of blocking the whole loop.
+    // A finite timeout: if the runtime can't hand over the image in time, give up
+    // rather than blocking the whole loop. Generous enough that a brief frame
+    // hitch (compositor still holding the image) doesn't drop the layer for a
+    // frame -- which showed up as the UI layer flickering on/off.
     XrSwapchainImageWaitInfo wi{ XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
-    wi.timeout = 10 * 1000 * 1000; // 10 ms
+    wi.timeout = 100 * 1000 * 1000; // 100 ms
     const XrResult r = xrWaitSwapchainImage(sc.handle, &wi);
     if (r == XR_TIMEOUT_EXPIRED) {
         XrSwapchainImageReleaseInfo ri{ XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
         xrReleaseSwapchainImage(sc.handle, &ri);
-        static bool warned = false;
-        if (!warned) {
-            SPDLOG_WARN("[VR] xrWaitSwapchainImage timed out (eye {}); skipping frame.", e);
-            warned = true;
-        }
         return;
     }
     if (Failed(r, "xrWaitSwapchainImage")) {
         return;
     }
     sc.acquired = true;
-    eyeValid[e] = true;
+    valid = true;
 }
 
-void Context::ReleaseEye(int e) {
-    EyeSwapchain& sc = eyes[e];
+void Context::ReleaseSwap(EyeSwapchain& sc) {
     if (sc.handle == XR_NULL_HANDLE || !sc.acquired) {
         return;
     }
@@ -1190,14 +1229,15 @@ bool Context::BeginFrame() {
     }
     SyncActions();
     frameBegun = true;
-    AcquireEye(0);
-    AcquireEye(1);
+    AcquireSwap(eyes[0], eyeValid[0]);
+    AcquireSwap(eyes[1], eyeValid[1]);
+    AcquireSwap(uiSwap, uiValid);
     return true;
 }
 
 void Context::SubmitLayers(bool submitContent) {
-    XrCompositionLayerQuad quads[2];
-    const XrCompositionLayerBaseHeader* layers[2] = { nullptr, nullptr };
+    XrCompositionLayerQuad quads[3];
+    const XrCompositionLayerBaseHeader* layers[3] = { nullptr, nullptr, nullptr };
     uint32_t layerCount = 0;
 
     if (submitContent) {
@@ -1206,7 +1246,7 @@ void Context::SubmitLayers(bool submitContent) {
             if (!eyeValid[e] || eyes[e].handle == XR_NULL_HANDLE) {
                 continue; // never submit an image we did not acquire+release
             }
-            XrCompositionLayerQuad& q = quads[e];
+            XrCompositionLayerQuad& q = quads[layerCount];
             q = { XR_TYPE_COMPOSITION_LAYER_QUAD };
             q.layerFlags = 0;
             q.space = localSpace;
@@ -1217,6 +1257,36 @@ void Context::SubmitLayers(bool submitContent) {
             q.subImage.imageRect.extent.height = (int32_t)eyes[e].height;
             q.pose = screenPose;
             q.size = screenSize;
+            layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&q);
+        }
+
+        // Flat mono UI, floated in front of the 3D screen along its own normal
+        // and scaled to subtend the same angle, so it lines up with the screen
+        // but always composites on top and is never clipped by scene depth.
+        // screenDir is the head->screen direction, so -screenDir moves the UI
+        // toward the viewer (physically in front of the screen).
+        if (haveUiContent && uiValid && uiSwap.handle != XR_NULL_HANDLE && g_uiDistance > 0.0f) {
+            const float dist = g_screenDistance;
+            const float scale = dist > 0.1f ? std::max(0.05f, dist - g_uiDistance) / dist : 1.0f;
+
+            XrCompositionLayerQuad& q = quads[layerCount];
+            q = { XR_TYPE_COMPOSITION_LAYER_QUAD };
+            // Use the texture's own (straight) alpha, otherwise the compositor
+            // treats the quad as opaque and the UI's transparent pixels render
+            // black over the 3D screen.
+            q.layerFlags =
+                XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT | XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT;
+            q.space = localSpace;
+            q.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+            q.subImage.swapchain = uiSwap.handle;
+            q.subImage.imageRect.offset = { 0, 0 };
+            q.subImage.imageRect.extent.width = (int32_t)uiSwap.width;
+            q.subImage.imageRect.extent.height = (int32_t)uiSwap.height;
+            q.pose = screenPose;
+            q.pose.position.x -= screenDir.x * g_uiDistance;
+            q.pose.position.y -= screenDir.y * g_uiDistance;
+            q.pose.position.z -= screenDir.z * g_uiDistance;
+            q.size = { screenSize.width * scale, screenSize.height * scale };
             layers[layerCount++] = reinterpret_cast<const XrCompositionLayerBaseHeader*>(&q);
         }
     }
@@ -1233,8 +1303,9 @@ void Context::EndFrame(bool submitContent) {
     if (!frameBegun) {
         return;
     }
-    ReleaseEye(0);
-    ReleaseEye(1);
+    ReleaseSwap(eyes[0]);
+    ReleaseSwap(eyes[1]);
+    ReleaseSwap(uiSwap);
     SubmitLayers(submitContent && haveContent);
     frameBegun = false;
 }
@@ -1259,10 +1330,11 @@ DXGI_FORMAT UnormViewFormat(int64_t fmt) {
     }
 }
 
-// Copies the game's current framebuffer into this eye's intermediate texture.
-void CopyGameFbToEyeTex(Fast::Interpreter* interp, Context* c, int eye) {
+// Copies the game's current framebuffer into an intermediate texture (an eye
+// target or the UI target).
+void CopyGameFbTo(Fast::Interpreter* interp, Context* c, ComPtr<ID3D11Texture2D>& dst, uint32_t w, uint32_t h) {
     uintptr_t fb = interp->mGfxFrameBuffer;
-    if (fb == 0 || !c->eyeTex[eye]) {
+    if (fb == 0 || !dst) {
         return;
     }
     auto* srv = reinterpret_cast<ID3D11ShaderResourceView*>(fb);
@@ -1277,28 +1349,25 @@ void CopyGameFbToEyeTex(Fast::Interpreter* interp, Context* c, int eye) {
     }
     D3D11_TEXTURE2D_DESC sd{}, dd{};
     src->GetDesc(&sd);
-    c->eyeTex[eye]->GetDesc(&dd);
+    dst->GetDesc(&dd);
     ID3D11DeviceContext* ctx = c->DeviceContext();
     if (sd.Width == dd.Width && sd.Height == dd.Height && sd.Format == dd.Format) {
-        ctx->CopyResource(c->eyeTex[eye].Get(), src.Get());
+        ctx->CopyResource(dst.Get(), src.Get());
     } else if (c->blitter.ready) {
-        c->blitter.Blit(c->Device(), ctx, srv, c->eyeTex[eye].Get(), DXGI_FORMAT_R8G8B8A8_UNORM, c->renderWidth,
-                        c->renderHeight);
+        c->blitter.Blit(c->Device(), ctx, srv, dst.Get(), DXGI_FORMAT_R8G8B8A8_UNORM, w, h);
     }
 }
 
-// Copies an eye's intermediate texture into its acquired XR swapchain image.
-void BlitEyeTexToSwapchain(Context* c, int eye) {
-    EyeSwapchain& sc = c->eyes[eye];
-    if (!sc.acquired || !c->eyeSrv[eye] || !c->blitter.ready) {
+// Copies an intermediate texture into an acquired XR swapchain image.
+void BlitTexToSwapchain(Context* c, ID3D11ShaderResourceView* srv, EyeSwapchain& sc) {
+    if (!sc.acquired || !srv || !c->blitter.ready) {
         return;
     }
     ID3D11Texture2D* dst = sc.images[sc.acquiredIndex].texture;
     if (!dst) {
         return;
     }
-    c->blitter.Blit(c->Device(), c->DeviceContext(), c->eyeSrv[eye].Get(), dst, UnormViewFormat(sc.format), sc.width,
-                    sc.height);
+    c->blitter.Blit(c->Device(), c->DeviceContext(), srv, dst, UnormViewFormat(sc.format), sc.width, sc.height);
 }
 
 // Converts a packed N64 fixed-point matrix to floats, using the exact layout the
@@ -1393,7 +1462,130 @@ void RenderEyeToTex(Fast::Interpreter* interp, Context* c, int eye, Gfx* command
 
     interp->Run(commands, map, {});
 
-    CopyGameFbToEyeTex(interp, c, eye);
+    CopyGameFbTo(interp, c, c->eyeTex[eye], c->renderWidth, c->renderHeight);
+}
+
+// Debug: dump a texture to a BMP (headless diagnosis of the UI/world layers).
+void DumpTextureBmp(Context* c, ID3D11Texture2D* tex, const char* path) {
+    if (!tex) {
+        return;
+    }
+    D3D11_TEXTURE2D_DESC d{};
+    tex->GetDesc(&d);
+    D3D11_TEXTURE2D_DESC sd = d;
+    sd.Usage = D3D11_USAGE_STAGING;
+    sd.BindFlags = 0;
+    sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    sd.MiscFlags = 0;
+    ComPtr<ID3D11Texture2D> staging;
+    if (FAILED(c->Device()->CreateTexture2D(&sd, nullptr, &staging))) {
+        return;
+    }
+    c->DeviceContext()->CopyResource(staging.Get(), tex);
+    D3D11_MAPPED_SUBRESOURCE m{};
+    if (FAILED(c->DeviceContext()->Map(staging.Get(), 0, D3D11_MAP_READ, 0, &m))) {
+        return;
+    }
+    FILE* f = nullptr;
+    fopen_s(&f, path, "wb");
+    if (f) {
+        const uint32_t w = d.Width, h = d.Height;
+        const uint32_t rowBytes = w * 4;
+        const uint32_t imgSize = rowBytes * h;
+        uint8_t hdr[54] = { 'B', 'M' };
+        auto put32 = [&](int off, uint32_t v) { memcpy(hdr + off, &v, 4); };
+        put32(2, 54 + imgSize);
+        put32(10, 54);
+        put32(14, 40);
+        put32(18, w);
+        put32(22, h);
+        hdr[26] = 1;
+        hdr[28] = 32;
+        put32(34, imgSize);
+        fwrite(hdr, 1, 54, f);
+        const uint8_t* base = (const uint8_t*)m.pData;
+        for (uint32_t y = 0; y < h; ++y) {
+            fwrite(base + (h - 1 - y) * m.RowPitch, 1, rowBytes, f);
+        }
+        fclose(f);
+        SPDLOG_INFO("[VR] dumped {}", path);
+    }
+    c->DeviceContext()->Unmap(staging.Get(), 0);
+}
+
+// Clears the game framebuffer to fully transparent black. The keyed copy
+// (kPsKey) then makes everything the UI did not draw transparent. The engine's
+// ClearFramebuffer always clears to its own colour, so do it ourselves on the
+// fb's own texture.
+void ClearGameFbTransparent(Context* c, Fast::Interpreter* interp) {
+    uintptr_t fb = interp->mGfxFrameBuffer;
+    if (fb == 0) {
+        return;
+    }
+    auto* srv = reinterpret_cast<ID3D11ShaderResourceView*>(fb);
+    ComPtr<ID3D11Resource> res;
+    srv->GetResource(res.GetAddressOf());
+    ComPtr<ID3D11Texture2D> tex;
+    if (res) {
+        res.As(&tex);
+    }
+    if (!tex) {
+        return;
+    }
+    D3D11_TEXTURE2D_DESC d{};
+    tex->GetDesc(&d);
+    D3D11_RENDER_TARGET_VIEW_DESC rtvDesc{};
+    rtvDesc.Format = UnormViewFormat(d.Format);
+    rtvDesc.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+    ComPtr<ID3D11RenderTargetView> rtv;
+    if (FAILED(c->Device()->CreateRenderTargetView(tex.Get(), &rtvDesc, &rtv))) {
+        return;
+    }
+    const float clear[4] = { 0.0f, 0.0f, 0.0f, 0.0f }; // transparent
+    c->DeviceContext()->ClearRenderTargetView(rtv.Get(), clear);
+}
+
+// Renders the on-screen UI once into the (mono) UI texture, on a transparent
+// backdrop, so it can be shown as a flat layer in front of the 3D screen. It is
+// rendered with an empty matrix map so it is screen-space only (never the 3D
+// perspective) and identical in both eyes.
+void RenderUiToTex(Fast::Interpreter* interp, Context* c, Gfx* uiCommands) {
+    if (uiCommands == nullptr || !c->uiTex || !c->uiSrv) {
+        static bool s_warned = false;
+        if (!s_warned) {
+            s_warned = true;
+            SPDLOG_WARN("[VR] UI layer skipped: uiCommands={} uiTex={} uiSrv={}", (void*)uiCommands, (bool)c->uiTex,
+                        (bool)c->uiSrv);
+        }
+        return;
+    }
+    static bool s_loggedUi = false;
+    if (!s_loggedUi) {
+        s_loggedUi = true;
+        SPDLOG_INFO("[VR] UI layer active: list={} fb={}x{}", (void*)uiCommands, c->renderWidth, c->renderHeight);
+    }
+    auto* rapi = interp->GetCurrentRenderingAPI();
+    rapi->StartDrawToFramebuffer(interp->mGameFb, 1.0f);
+    rapi->ClearFramebuffer(false, true); // depth only; colour cleared to the key below
+    ClearGameFbTransparent(c, interp);
+    interp->Run(uiCommands, {}, {});
+    // Copy with a coverage key so the layer alpha reflects what the UI drew (see
+    // kPsKey) instead of the RDP's per-sprite alpha, which punches holes.
+    uintptr_t fb = interp->mGfxFrameBuffer;
+    if (fb != 0 && c->uiTex && c->blitter.ready) {
+        auto* srv = reinterpret_cast<ID3D11ShaderResourceView*>(fb);
+        c->blitter.Blit(c->Device(), c->DeviceContext(), srv, c->uiTex.Get(), DXGI_FORMAT_R8G8B8A8_UNORM,
+                        c->renderWidth, c->renderHeight, /*keyed=*/true);
+    }
+    c->haveUiContent = true;
+    static int s_dumpFrame = 0;
+    if (std::getenv("PAPERBOAT_VR_DUMP") != nullptr && (++s_dumpFrame % 60) == 1 && s_dumpFrame <= 60 * 180) {
+        char p[64];
+        snprintf(p, sizeof(p), "dump/ui_%03d.bmp", s_dumpFrame / 60);
+        DumpTextureBmp(c, c->uiTex.Get(), p);
+        snprintf(p, sizeof(p), "dump/eye_%03d.bmp", s_dumpFrame / 60);
+        DumpTextureBmp(c, c->eyeTex[0].Get(), p);
+    }
 }
 
 // Makes the next Run() render offscreen into mGameFb at the interpreter's
@@ -1514,6 +1706,7 @@ constexpr const char* kCvarEnabled = "gVR.Enabled";
 constexpr const char* kCvarScreenSize = "gVR.ScreenSize";
 constexpr const char* kCvarScreenDistance = "gVR.ScreenDistance";
 constexpr const char* kCvarStereoStrength = "gVR.StereoStrength";
+constexpr const char* kCvarUiDistance = "gVR.UiDistance";
 
 // Reads a float CVar in a type-tolerant way. The port's CVarGetFloat returns the
 // DEFAULT whenever the stored value's type isn't Float -- which happens when a
@@ -1555,6 +1748,7 @@ void LoadSettings() {
     g_screenWidth = CvarFloat(kCvarScreenSize, kDefaultScreenSize);
     g_screenDistance = CvarFloat(kCvarScreenDistance, kDefaultScreenDistance);
     g_stereoStrength = CvarFloat(kCvarStereoStrength, kDefaultStereoStrength);
+    g_uiDistance = CvarFloat(kCvarUiDistance, kDefaultUiDistance);
     SPDLOG_INFO("[VR] Settings loaded: enabled={} screenSize={:.2f}m distance={:.2f}m stereo={:.2f}", g_enabled,
                 g_screenWidth, g_screenDistance, g_stereoStrength);
 }
@@ -1775,23 +1969,26 @@ void ReloadSettings() {
     const float size = CvarFloat(kCvarScreenSize, kDefaultScreenSize);
     const float dist = CvarFloat(kCvarScreenDistance, kDefaultScreenDistance);
     const float stereo = CvarFloat(kCvarStereoStrength, kDefaultStereoStrength);
+    const float uiDist = CvarFloat(kCvarUiDistance, kDefaultUiDistance);
     // The settings menu fires its callback every frame, so only apply (and log)
     // when something actually changed.
-    if (enabled == g_enabled && size == g_screenWidth && dist == g_screenDistance && stereo == g_stereoStrength) {
+    if (enabled == g_enabled && size == g_screenWidth && dist == g_screenDistance && stereo == g_stereoStrength &&
+        uiDist == g_uiDistance) {
         return;
     }
     g_enabled = enabled;
     g_screenWidth = size;
     g_screenDistance = dist;
     g_stereoStrength = stereo;
+    g_uiDistance = uiDist;
     if (g_ctx != nullptr) {
         const float aspect = g_ctx->renderWidth > 0 ? (float)g_ctx->renderHeight / (float)g_ctx->renderWidth : 0.75f;
         g_ctx->screenSize.width = g_screenWidth;
         g_ctx->screenSize.height = g_screenWidth * aspect;
         ApplyDistance();
     }
-    SPDLOG_INFO("[VR] ReloadSettings: enabled={} size={:.2f} dist={:.2f} stereo={:.2f}", g_enabled, g_screenWidth,
-                g_screenDistance, g_stereoStrength);
+    SPDLOG_INFO("[VR] ReloadSettings: enabled={} size={:.2f} dist={:.2f} stereo={:.2f} uiDist={:.2f}", g_enabled,
+                g_screenWidth, g_screenDistance, g_stereoStrength, g_uiDistance);
 }
 
 float GetStereoStrength() {
@@ -1802,6 +1999,16 @@ void SetStereoStrength(float strength) {
     LoadSettings();
     g_stereoStrength = std::clamp(strength, 0.0f, 20.0f);
     CVarSetFloat(kCvarStereoStrength, g_stereoStrength);
+}
+
+float GetUiDistance() {
+    LoadSettings();
+    return g_uiDistance;
+}
+void SetUiDistance(float metres) {
+    LoadSettings();
+    g_uiDistance = std::clamp(metres, 0.0f, 2.0f);
+    CVarSetFloat(kCvarUiDistance, g_uiDistance);
 }
 
 void PollHotkeys() {
@@ -1838,7 +2045,7 @@ void PollHotkeys() {
     }
 }
 
-bool RenderGameFrame(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtxReplacements) {
+bool RenderGameFrame(Gfx* commands, Gfx* uiCommands, const std::unordered_map<Mtx*, MtxF>& mtxReplacements) {
     if (!g_enabled || g_ctx == nullptr || !g_ctx->initialized) {
         return false;
     }
@@ -1885,6 +2092,10 @@ bool RenderGameFrame(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtxRep
     PrepareOffscreen(interp);
     const double tPrep = NowMs();
 
+    // On-screen UI first: rendered once (mono, screen-space) on a transparent
+    // backdrop into its own texture, shown as a flat layer in front of the screen.
+    RenderUiToTex(interp, g_ctx, uiCommands);
+
     const float half = g_stereoStrength * 0.5f;
     // Snapshot the camera matrices once so both eyes share an identical base.
     std::unordered_map<Mtx*, MtxF> base = mtxReplacements;
@@ -1915,14 +2126,15 @@ bool RenderGameFrame(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtxRep
     // window's target FPS, which starves the headset loop and pins it to the game
     // rate. Present it only every Nth game frame (the limiter has long elapsed by
     // then, so it is nearly free) and use the cheap path otherwise.
-    // Only a spectator mirror. Its DXGI present is an extra GPU/display surface
-    // that does not exist in a normal VR app, and presenting a desktop swapchain
-    // while an overlay (e.g. Virtual Desktop) takes over the display is exactly
-    // the kind of thing that can trip a device removal. Default: OFF while VR is
-    // active (set PAPERBOAT_VR_MIRROR=N to re-enable, N = game frames per present).
+    // The desktop mirror keeps the window (game + ImGui settings) alive. Its DXGI
+    // present is an extra GPU/display surface that normally isn't present in a VR
+    // app, and presenting a desktop swapchain while an overlay (e.g. Virtual
+    // Desktop) takes over the display once tripped a device removal, so it is
+    // presented at a reduced rate. Set PAPERBOAT_VR_MIRROR=0 to disable it
+    // entirely (desktop window then freezes), or N = game frames per present.
     static const int s_mirrorPeriod = [] {
         const char* v = std::getenv("PAPERBOAT_VR_MIRROR");
-        return v == nullptr ? 0 : std::max(0, std::atoi(v));
+        return v == nullptr ? 2 : std::max(0, std::atoi(v));
     }();
     static int s_mirrorCounter = 0;
     if (s_mirrorPeriod > 0 && (++s_mirrorCounter % s_mirrorPeriod) == 0) {
@@ -1993,8 +2205,11 @@ void PresentFrame() {
     // runtime sets shouldRender=false.
     const bool submit = g_ctx->haveContent;
     if (submit) {
-        BlitEyeTexToSwapchain(g_ctx, 0);
-        BlitEyeTexToSwapchain(g_ctx, 1);
+        BlitTexToSwapchain(g_ctx, g_ctx->eyeSrv[0].Get(), g_ctx->eyes[0]);
+        BlitTexToSwapchain(g_ctx, g_ctx->eyeSrv[1].Get(), g_ctx->eyes[1]);
+        if (g_ctx->haveUiContent) {
+            BlitTexToSwapchain(g_ctx, g_ctx->uiSrv.Get(), g_ctx->uiSwap);
+        }
         // Submit the swapchain writes to the GPU *before* releasing the images /
         // handing them to the compositor. The XR swapchains are cross-process
         // shared textures, so if the drawing is still only queued the compositor's
@@ -2062,7 +2277,7 @@ uint32_t GetTargetFpsOverride() {
     return 0;
 }
 void UpdateResolutionCap(Fast::Interpreter*) {}
-bool RenderGameFrame(Gfx*, const std::unordered_map<Mtx*, MtxF>&) {
+bool RenderGameFrame(Gfx*, Gfx*, const std::unordered_map<Mtx*, MtxF>&) {
     return false;
 }
 void PresentFrame() {}
@@ -2080,6 +2295,10 @@ float GetStereoStrength() {
     return 0.0f;
 }
 void SetStereoStrength(float) {}
+float GetUiDistance() {
+    return 0.0f;
+}
+void SetUiDistance(float) {}
 void ReloadSettings() {}
 } // namespace Paperboat::VR
 

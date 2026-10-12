@@ -95,11 +95,12 @@ class GameEngine {
     }
     static void RelaunchIfRequested(int argc, char* argv[]);
 
-    static void RunCommands(Gfx* Commands, const std::vector<std::unordered_map<Mtx*, MtxF>>& mtx_replacements);
+    static void RunCommands(Gfx* Commands, Gfx* worldCommands, Gfx* uiCommands,
+                            const std::vector<std::unordered_map<Mtx*, MtxF>>& mtx_replacements);
     static void Destroy();
     static uint32_t GetInterpolationFPS();
     static uint32_t GetInterpolationFrameCount();
-    static void ProcessGfxCommands(Gfx* commands);
+    static void ProcessGfxCommands(Gfx* commands, Gfx* worldCommands, Gfx* uiCommands);
 
     static int ShowYesNoBox(const char* title, const char* box);
     static void ShowMessage(const char* title, const char* message, SDL_MessageBoxFlags type = SDL_MESSAGEBOX_ERROR);
@@ -129,12 +130,12 @@ extern "C" {
 
 void* GameEngine_Malloc(size_t size);
 #ifdef __cplusplus
-void GameEngine_ProcessGfxCommands(Gfx* commands);
+void GameEngine_ProcessGfxCommands(Gfx* commands, Gfx* worldCommands, Gfx* uiCommands);
 #else
 // In C translation units the N64 typedefs may not be visible yet, so declare
 // with void* and let callers cast.  The actual definition in Engine.cpp uses
 // the real types.
-void GameEngine_ProcessGfxCommands(void* commands);
+void GameEngine_ProcessGfxCommands(void* commands, void* worldCommands, void* uiCommands);
 #endif
 void GameEngine_LogInfo(const char* fmt, ...);
 void GameEngine_LogStackTrace(const char* label);

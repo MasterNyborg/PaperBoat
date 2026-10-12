@@ -556,6 +556,22 @@ void PaperboatMenu::AddMenuSettings() {
                 .Max(20.0f)
                 .DefaultValue(3.0f)
         );
+    AddWidget(path, "UI Distance (m)", WIDGET_CVAR_SLIDER_FLOAT)
+        .CVar("gVR.UiDistance")
+        .RaceDisable(false)
+        .Callback([](WidgetInfo&) { Paperboat::VR::ReloadSettings(); })
+        .Options(
+            FloatSliderOptions()
+                .Tooltip(
+                    "How far the game's on-screen UI (HUD, dialogue, menus) floats in front of the 3D "
+                    "screen in the headset. Larger = further forward, so it never clashes with scene depth."
+                )
+                .Format("%.2f")
+                .Step(0.05f)
+                .Min(0.0f)
+                .Max(2.0f)
+                .DefaultValue(0.35f)
+        );
 
     // Notifications
     path.sidebarName = "Notifications";
