@@ -339,9 +339,10 @@ float g_stereoStrength = kDefaultStereoStrength;
 // Watchdog for a runtime that stopped presenting (headset asleep/disconnected).
 // If an XR frame takes pathologically long, or the swapchains stop being handed
 // over, we stop pumping the XR frame loop so the game keeps running on the
-// desktop at full speed; we then retry periodically to resume when it comes back.
+// desktop at full speed. We only resume when the session state changes (which is
+// what happens when the headset wakes) -- never on a timer, because a retry
+// itself blocks in xrWaitFrame for as long as the runtime is throttling.
 bool g_pumpPaused = false;
-double g_pumpRetryAtMs = 0.0;
 
 // ---------------------------------------------------------------------------
 // Temporary frame-timing instrumentation (removed once pacing is verified).
@@ -365,16 +366,15 @@ bool VrActive() {
     return g_enabled && g_ctx != nullptr && g_ctx->sessionRunning && !g_pumpPaused;
 }
 
-// Pauses the XR frame pump for `delayMs` (the runtime stopped presenting).
+// Pauses the XR frame pump (the runtime stopped presenting).
 void PausePump(const char* why) {
     if (!g_pumpPaused) {
         SPDLOG_WARN("[VR] Runtime not presenting ({}); pausing headset submission, running on desktop.", why);
     }
     g_pumpPaused = true;
-    g_pumpRetryAtMs = NowMs() + 1000.0;
 }
 
-// Clears a pause early (e.g. when the session state actually changes).
+// Clears a pause (the session state changed, e.g. the headset woke).
 void ResumePumpIfPaused() {
     if (g_pumpPaused) {
         g_pumpPaused = false;
@@ -1815,12 +1815,10 @@ void PresentFrame() {
     if (!g_ctx->sessionRunning) {
         return;
     }
-    // If we backed off from a stalled runtime, only retry occasionally.
+    // If the runtime stopped presenting, do nothing until the session state
+    // changes (a retry would block for as long as the runtime throttles).
     if (g_pumpPaused) {
-        if (NowMs() < g_pumpRetryAtMs) {
-            return;
-        }
-        g_pumpPaused = false; // retry now
+        return;
     }
     const bool visible = VrDebugEnabled()
                              ? true
@@ -1861,10 +1859,14 @@ void PresentFrame() {
 
     // Watchdog: a single frame that took pathologically long means the runtime
     // stopped presenting (headset asleep / link dropped). Back off so the game
-    // keeps running on the desktop instead of stalling every frame.
-    if (t3 - t0 > 250.0) {
+    // keeps running on the desktop instead of stalling every frame. Only applies
+    // while the runtime is supposed to be presenting (VISIBLE/FOCUSED), so the
+    // startup ramp is never misdiagnosed as a stall.
+    const bool presenting = g_ctx->sessionState == XR_SESSION_STATE_VISIBLE ||
+                            g_ctx->sessionState == XR_SESSION_STATE_FOCUSED;
+    if (presenting && t3 - t0 > 250.0) {
         PausePump("frame took too long");
-    } else if (g_ctx->eyes[0].handle != XR_NULL_HANDLE && g_ctx->eyes[1].handle != XR_NULL_HANDLE &&
+    } else if (presenting && g_ctx->eyes[0].handle != XR_NULL_HANDLE && g_ctx->eyes[1].handle != XR_NULL_HANDLE &&
                !g_ctx->eyeValid[0] && !g_ctx->eyeValid[1]) {
         // Even xrBeginFrame succeeded, the swapchains were never handed over.
         PausePump("swapchain images unavailable");

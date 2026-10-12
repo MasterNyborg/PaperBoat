@@ -81,9 +81,10 @@ called, so they survive restarts and work even with no headset attached.
   loader/runtime fault a few seconds later). The game continues on the desktop.
 - **Watchdog / backoff**: if a single XR frame takes > 250 ms, or the swapchains
   stop being handed over, we assume the runtime stopped presenting and pause the
-  pump (retrying every second). This keeps a stalled/absent runtime from
-  throttling the game via blocking `xrWaitFrame`/`xrWaitSwapchainImage` calls
-  (which are otherwise the classic cause of "VR makes the game lag").
+  pump. We then resume only when the session state actually changes (e.g. the
+  headset wakes) — never on a timer, because a retry would block in `xrWaitFrame`
+  for as long as the runtime is throttling (which is what turned "headset asleep"
+  into 1 fps). While paused the game runs on the desktop at full speed.
 
 ## Key files / hooks
 
