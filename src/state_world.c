@@ -14,18 +14,15 @@ void state_init_world(void) {
     set_game_mode_render_frontUI(state_world_draw_aux_ui);
 
 #ifdef DX_QUICK_LAUNCH_BATTLE
+    // Optional debug hook: boot straight into a battle only when asked, via
+    // PAPERBOAT_BOOT_BATTLE="battle,stage" (decimal or 0x hex), e.g. "0,2".
+    // Unset (the normal case) loads the save into the overworld as usual.
     if (gGameStatus.loadType == LOAD_FROM_FILE_SELECT) {
-        // Port debug hook: boot straight into a battle without recompiling.
-        // PAPERBOAT_BOOT_BATTLE="battle,stage" (decimal or 0x hex), e.g. "0,2".
         const char* env = getenv("PAPERBOAT_BOOT_BATTLE");
-        if (env != NULL && env[0] != '\0') {
-            if (strcmp(env, "none") != 0) { // "none" = stay in the overworld
-                long battle = 0, stage = -1;
-                sscanf(env, "%li,%li", &battle, &stage);
-                dx_debug_begin_battle_with_IDs((s16)battle, (s16)stage);
-            }
-        } else {
-            dx_debug_begin_battle_with_IDs(DX_QUICK_LAUNCH_BATTLE);
+        if (env != NULL && env[0] != '\0' && strcmp(env, "none") != 0) {
+            long battle = 0, stage = -1;
+            sscanf(env, "%li,%li", &battle, &stage);
+            dx_debug_begin_battle_with_IDs((s16)battle, (s16)stage);
         }
     }
 #endif
