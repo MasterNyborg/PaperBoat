@@ -1081,6 +1081,11 @@ void GameEngine::AudioExit() {
     }
 }
 
+// Background display list of the frame currently being processed (set by
+// Graphics_DrawFrame). The renderer uses it to scope the VR per-eye background
+// horizontal offset to the texture rectangles of that list only.
+static Gfx* sBackgroundList = nullptr;
+
 void GameEngine::RunCommands(Gfx* Commands, const std::vector<std::unordered_map<Mtx*, MtxF>>& mtx_replacements) {
     auto wnd = std::dynamic_pointer_cast<Fast::Fast3dWindow>(Ship::Context::GetRawInstance()->GetWindow());
 
@@ -1094,6 +1099,12 @@ void GameEngine::RunCommands(Gfx* Commands, const std::vector<std::unordered_map
     wnd->HandleEvents();
 
     interpreter->mInterpolationIndex = 0;
+
+    // Scope the VR per-eye background horizontal offset to this frame's
+    // background list, and clear any offset left over from a previous VR run
+    // (the desktop path must render the background mono).
+    interpreter->mBackgroundDlList = sBackgroundList;
+    interpreter->mBackgroundRectOffsetX = 0;
 
     // Initialise the OpenXR session the first time we render (the window and
     // interpreter are ready by now). No-op when there is no runtime/HMD.
@@ -1285,6 +1296,10 @@ extern "C" uint8_t GameEngine_OTRSigCheck(const char* data) {
 // C-callable wrapper for processing graphics commands
 extern "C" void GameEngine_ProcessGfxCommands(Gfx* commands) {
     GameEngine::ProcessGfxCommands(commands);
+}
+
+extern "C" void GameEngine_SetBackgroundList(Gfx* list) {
+    sBackgroundList = list;
 }
 
 // Renderer calls from tick code come through here

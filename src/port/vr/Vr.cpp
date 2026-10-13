@@ -356,6 +356,11 @@ float g_stereoStrength = kDefaultStereoStrength;
 // User trim (NDC) added to the auto zero-parallax shift. Positive moves the
 // zero-parallax plane nearer (scene recedes further behind the UI).
 float g_convergence = 0.0f;
+// Per-eye horizontal shift (pixels) applied to the background so it reads as
+// distant. Left eye gets -g_bgParallaxPx, right eye +g_bgParallaxPx (a point
+// behind the zero-parallax plane has its left view shifted left, right view
+// right). 0 = background stays mono.
+int g_bgParallaxPx = 4;
 
 // Watchdog for a runtime that stopped presenting (headset asleep/disconnected).
 // If an XR frame takes pathologically long, or the swapchains stop being handed
@@ -1462,6 +1467,13 @@ void RenderEyeToTex(Fast::Interpreter* interp, Context* c, int eye, Gfx* command
     rapi->StartDrawToFramebuffer(interp->mGameFb, 1.0f);
     rapi->ClearFramebuffer(true, true);
 
+    // The background sits at infinity, so it gets effectively no camera parallax
+    // (and is drawn as 2D rects that bypass the camera matrices entirely). Give
+    // it a small per-eye screen-space shift so it recedes behind the
+    // zero-parallax plane: left eye left, right eye right. The interpreter
+    // applies this only to rects in the registered background display list.
+    interp->mBackgroundRectOffsetX = (eye == 0 ? -g_bgParallaxPx : g_bgParallaxPx) * 4;
+
     interp->Run(commands, map, {});
 
     CopyGameFbToEyeTex(interp, c, eye);
@@ -1586,6 +1598,7 @@ constexpr const char* kCvarScreenSize = "gVR.ScreenSize";
 constexpr const char* kCvarScreenDistance = "gVR.ScreenDistance";
 constexpr const char* kCvarStereoStrength = "gVR.StereoStrength";
 constexpr const char* kCvarConvergence = "gVR.Convergence";
+constexpr const char* kCvarBackgroundParallax = "gVR.BackgroundParallax";
 
 // Reads a float CVar in a type-tolerant way. The port's CVarGetFloat returns the
 // DEFAULT whenever the stored value's type isn't Float -- which happens when a
@@ -1628,6 +1641,7 @@ void LoadSettings() {
     g_screenDistance = CvarFloat(kCvarScreenDistance, kDefaultScreenDistance);
     g_stereoStrength = CvarFloat(kCvarStereoStrength, kDefaultStereoStrength);
     g_convergence = CvarFloat(kCvarConvergence, 0.0f);
+    g_bgParallaxPx = (int)CvarFloat(kCvarBackgroundParallax, 4.0f);
     SPDLOG_INFO("[VR] Settings loaded: enabled={} screenSize={:.2f}m distance={:.2f}m stereo={:.2f}", g_enabled,
                 g_screenWidth, g_screenDistance, g_stereoStrength);
 }
@@ -1849,10 +1863,11 @@ void ReloadSettings() {
     const float dist = CvarFloat(kCvarScreenDistance, kDefaultScreenDistance);
     const float stereo = CvarFloat(kCvarStereoStrength, kDefaultStereoStrength);
     const float converge = CvarFloat(kCvarConvergence, 0.0f);
+    const int bgParallax = (int)CvarFloat(kCvarBackgroundParallax, 4.0f);
     // The settings menu fires its callback every frame, so only apply (and log)
     // when something actually changed.
     if (enabled == g_enabled && size == g_screenWidth && dist == g_screenDistance && stereo == g_stereoStrength &&
-        converge == g_convergence) {
+        converge == g_convergence && bgParallax == g_bgParallaxPx) {
         return;
     }
     g_enabled = enabled;
@@ -1860,6 +1875,7 @@ void ReloadSettings() {
     g_screenDistance = dist;
     g_stereoStrength = stereo;
     g_convergence = converge;
+    g_bgParallaxPx = std::clamp(bgParallax, 0, 64);
     if (g_ctx != nullptr) {
         const float aspect = g_ctx->renderWidth > 0 ? (float)g_ctx->renderHeight / (float)g_ctx->renderWidth : 0.75f;
         g_ctx->screenSize.width = g_screenWidth;

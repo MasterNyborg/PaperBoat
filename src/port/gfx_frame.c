@@ -84,6 +84,9 @@ void Graphics_DrawFrame(Gfx* backgroundList, Gfx* mainList, s32 capturePrevFrame
     gDPFullSync(g++);
     gSPEndDisplayList(g++);
 
+    // Let the renderer scope the VR per-eye background offset to this list.
+    GameEngine_SetBackgroundList(backgroundList);
+
     GameEngine_ProcessGfxCommands(sMasterList);
 }
 

@@ -136,6 +136,15 @@ void GameEngine_ProcessGfxCommands(Gfx* commands);
 // the real types.
 void GameEngine_ProcessGfxCommands(void* commands);
 #endif
+// Registers the background display list (prepended to the master list) with the
+// renderer so its texture rectangles can receive the VR per-eye horizontal
+// offset. Pass NULL when a frame has no background list. Call before
+// GameEngine_ProcessGfxCommands.
+#ifdef __cplusplus
+void GameEngine_SetBackgroundList(Gfx* list);
+#else
+void GameEngine_SetBackgroundList(void* list);
+#endif
 void GameEngine_LogInfo(const char* fmt, ...);
 void GameEngine_LogStackTrace(const char* label);
 

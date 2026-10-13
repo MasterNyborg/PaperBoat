@@ -1,0 +1,90 @@
+diff --git a/include/fast/interpreter.h b/include/fast/interpreter.h
+index a6151803..993bdca1 100644
+--- a/include/fast/interpreter.h
++++ b/include/fast/interpreter.h
+@@ -798,6 +798,16 @@ class Interpreter {
+     const std::unordered_map<Mtx*, MtxF>* mCurMtxReplacements;
+     const std::unordered_map<Gfx*, Gfx*>* mCurDlReplacements;
+     bool mMarkerOn; // This was originally a debug feature. Now it seems to control s2dex?
++
++    // Per-eye horizontal offset applied to texture rectangles while executing the
++    // registered background display list. The VR stereo renderer sets
++    // mBackgroundRectOffsetX before each eye so the background (which is drawn as
++    // 2D rectangles that bypass the camera matrices) gets a small screen-space
++    // parallax and reads as distant. Offset is in U10.2 fixed point (pixels * 4);
++    // mBackgroundScopes holds the cmd_stack depths where the scope was entered.
++    Gfx* mBackgroundDlList = nullptr;
++    int32_t mBackgroundRectOffsetX = 0;
++    std::vector<size_t> mBackgroundScopes;
+     // Registered custom shader templates (id -> o2r path). Paths are owned
+     // copies: ids live in compiled-pipeline cache keys for the whole session.
+     std::unordered_map<size_t, std::string> mShaders;
+@@ -826,6 +836,7 @@ class Interpreter {
+     std::vector<size_t> mDlShaderScopes;
+     void ApplyMaterialShader(const char* dlistPath);
+     void PopMaterialShaderScopes();
++    void PopBackgroundScopes();
+     int mPostPassNextId = 1;
+     int mPostPassFb[2] = { -1, -1 }; // ping-pong targets, created lazily
+     bool mPostManifestChecked = false;
+diff --git a/src/fast/interpreter.cpp b/src/fast/interpreter.cpp
+index 1c16baa6..d2fe2e8c 100644
+--- a/src/fast/interpreter.cpp
++++ b/src/fast/interpreter.cpp
+@@ -4983,6 +4983,12 @@ void Interpreter::GfxDrawRectangle(int32_t ulx, int32_t uly, int32_t lrx, int32_
+ 
+ void Interpreter::GfxDpTextureRectangle(int32_t ulx, int32_t uly, int32_t lrx, int32_t lry, uint8_t tile, int16_t uls,
+                                         int16_t ult, int16_t dsdx, int16_t dtdy, bool flip) {
++    // Per-eye background parallax: only inside the registered background DL.
++    if (!mBackgroundScopes.empty() && mBackgroundRectOffsetX != 0) {
++        ulx += mBackgroundRectOffsetX;
++        lrx += mBackgroundRectOffsetX;
++    }
++
+     // printf("render %d at %d\n", tile, lrx);
+     uint64_t saved_combine_mode = mRdp->combine_mode;
+     if ((mRdp->other_mode_h & (3U << G_MDSFT_CYCLETYPE)) == G_CYC_COPY) {
+@@ -5665,6 +5671,13 @@ void Interpreter::PopMaterialShaderScopes() {
+     }
+ }
+ 
++void Interpreter::PopBackgroundScopes() {
++    const size_t depth = g_exec_stack.cmd_stack.size();
++    while (!mBackgroundScopes.empty() && mBackgroundScopes.back() == depth) {
++        mBackgroundScopes.pop_back();
++    }
++}
++
+ size_t Interpreter::RegisterShaderPath(const char* path) {
+     for (const auto& shader : mShaders) {
+         if (shader.second == path) {
+@@ -6218,6 +6231,11 @@ bool gfx_dl_handler_common(F3DGfx** cmd0) {
+         // Push return address
+         if (subGFX != nullptr) {
+             g_exec_stack.call(*cmd0, subGFX);
++            // Register a per-eye background offset scope for the duration of this
++            // display list (see mBackgroundScopes); popped on the matching ENDDL.
++            if (subGFX == (F3DGfx*)gfx->mBackgroundDlList) {
++                gfx->mBackgroundScopes.push_back(g_exec_stack.cmd_stack.size());
++            }
+         }
+     } else {
+         (*cmd0) = subGFX;
+@@ -6316,6 +6334,8 @@ bool gfx_end_dl_handler_common(F3DGfx** cmd0) {
+     gfx->mMarkerOn = false;
+     // Close any material-shader scope opened for the DL that is returning
+     gfx->PopMaterialShaderScopes();
++    // Close any background-offset scope opened for the DL that is returning
++    gfx->PopBackgroundScopes();
+     g_exec_stack.ret();
+     return true;
+ }
+@@ -7929,6 +7949,8 @@ void Interpreter::Run(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtx_r
+ 
+     mCurMtxReplacements = &mtx_replacements;
+     mCurDlReplacements = &dl_replacements;
++    // Any background scopes left open by an interrupted previous run are stale.
++    mBackgroundScopes.clear();
+ 
+     mRapi->UpdateFramebufferParameters(0, mGfxCurrentWindowDimensions.width, mGfxCurrentWindowDimensions.height, 1,
+                                        false, true, true, !mRendersToFb);

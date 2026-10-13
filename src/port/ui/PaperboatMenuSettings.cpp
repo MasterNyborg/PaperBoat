@@ -573,6 +573,23 @@ void PaperboatMenu::AddMenuSettings() {
                 .Max(0.3f)
                 .DefaultValue(0.0f)
         );
+    AddWidget(path, "Background Parallax (px)", WIDGET_CVAR_SLIDER_FLOAT)
+        .CVar("gVR.BackgroundParallax")
+        .RaceDisable(false)
+        .Callback([](WidgetInfo&) { Paperboat::VR::ReloadSettings(); })
+        .Options(
+            FloatSliderOptions()
+                .Tooltip(
+                    "Per-eye horizontal shift of the 2D background, in pixels. The background is drawn behind the "
+                    "world geometry and receives no camera parallax, so without this it looks pasted on the screen "
+                    "plane. A small value pushes it behind the world to look distant. 0 = mono background."
+                )
+                .Format("%.0f")
+                .Step(1.0f)
+                .Min(0.0f)
+                .Max(32.0f)
+                .DefaultValue(4.0f)
+        );
 
     // Notifications
     path.sidebarName = "Notifications";
