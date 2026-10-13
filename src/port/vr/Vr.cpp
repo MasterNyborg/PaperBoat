@@ -2013,14 +2013,14 @@ bool RenderGameFrame(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtxRep
     // window's target FPS, which starves the headset loop and pins it to the game
     // rate. Present it only every Nth game frame (the limiter has long elapsed by
     // then, so it is nearly free) and use the cheap path otherwise.
-    // Only a spectator mirror. Its DXGI present is an extra GPU/display surface
-    // that does not exist in a normal VR app, and presenting a desktop swapchain
-    // while an overlay (e.g. Virtual Desktop) takes over the display is exactly
-    // the kind of thing that can trip a device removal. Default: OFF while VR is
-    // active (set PAPERBOAT_VR_MIRROR=N to re-enable, N = game frames per present).
+    // The desktop window mirrors the left eye. Its DXGI present is an extra
+    // GPU/display surface (which can interact with desktop overlays such as
+    // Virtual Desktop), so present it every Nth game frame: default 2 (~30 Hz
+    // mirror) so the desktop view is visible; set PAPERBOAT_VR_MIRROR=0 to turn
+    // the mirror off entirely.
     static const int s_mirrorPeriod = [] {
         const char* v = std::getenv("PAPERBOAT_VR_MIRROR");
-        return v == nullptr ? 0 : std::max(0, std::atoi(v));
+        return v == nullptr ? 2 : std::max(0, std::atoi(v));
     }();
     static int s_mirrorCounter = 0;
     if (s_mirrorPeriod > 0 && (++s_mirrorCounter % s_mirrorPeriod) == 0) {
