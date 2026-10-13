@@ -556,21 +556,22 @@ void PaperboatMenu::AddMenuSettings() {
                 .Max(20.0f)
                 .DefaultValue(3.0f)
         );
-    AddWidget(path, "UI Distance (m)", WIDGET_CVAR_SLIDER_FLOAT)
-        .CVar("gVR.UiDistance")
+    AddWidget(path, "Zero Parallax Trim", WIDGET_CVAR_SLIDER_FLOAT)
+        .CVar("gVR.Convergence")
         .RaceDisable(false)
         .Callback([](WidgetInfo&) { Paperboat::VR::ReloadSettings(); })
         .Options(
             FloatSliderOptions()
                 .Tooltip(
-                    "How far the game's on-screen UI (HUD, dialogue, menus) floats in front of the 3D "
-                    "screen in the headset. Larger = further forward, so it never clashes with scene depth."
+                    "Adjusts which depth sits on the screen plane (the stereo zero-parallax plane). The plane is "
+                    "auto-placed on what the camera looks at; this nudges it. Positive pulls the plane nearer, so "
+                    "more of the scene recedes behind the on-screen UI instead of crossing in front of it."
                 )
-                .Format("%.2f")
-                .Step(0.05f)
-                .Min(0.0f)
-                .Max(2.0f)
-                .DefaultValue(0.35f)
+                .Format("%.3f")
+                .Step(0.005f)
+                .Min(-0.3f)
+                .Max(0.3f)
+                .DefaultValue(0.0f)
         );
 
     // Notifications

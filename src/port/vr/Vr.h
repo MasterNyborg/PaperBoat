@@ -57,14 +57,11 @@ void UpdateResolutionCap(Fast::Interpreter* interpreter);
 // Renders one presented frame to the headset in stereo, and mirrors the left eye
 // to the desktop window. `mtxReplacements` is the per-subframe interpolation map
 // the port would normally hand to Fast3dWindow::DrawAndRunGraphicsCommands.
-// `uiCommands` is the on-screen UI display list (a separate list emitted by the
-// game); it is rendered once, screen-space, and shown as a flat layer in front of
-// the 3D screen.
 //
 // Returns true if VR handled the frame (caller must NOT also draw normally).
 // Returns false when VR is inactive/unfocused so the caller falls back to the
 // regular desktop path.
-bool RenderGameFrame(Gfx* commands, Gfx* uiCommands, const std::unordered_map<Mtx*, MtxF>& mtxReplacements);
+bool RenderGameFrame(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtxReplacements);
 
 // Submits one frame to the headset at the display rate, reusing the most recent
 // game render. Call once per main-loop iteration so the headset always receives
@@ -84,9 +81,8 @@ float GetScreenDistance();        // metres in front of the head
 void SetScreenDistance(float metres);
 float GetStereoStrength();        // half-IPD in game world units
 void SetStereoStrength(float strength);
-
-float GetUiDistance();            // metres the UI quad floats in front of the screen
-void SetUiDistance(float metres);
+float GetConvergence();           // zero-parallax trim (NDC); positive = nearer plane
+void SetConvergence(float ndc);
 
 // Re-reads the persisted settings (gVR.* CVars) and applies them live. The
 // settings menu widgets write the CVars directly and call this.

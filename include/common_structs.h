@@ -2198,11 +2198,7 @@ typedef struct {
     /* 0x00230 */ Gfx mainGfx[DISPLAYCONTEXT_GFX_COUNT];
     /* 0x10630 */ Gfx backgroundGfx[0x600]; // used by gfx_task_background (enlarged: widescreen tiles the scrolling bg across the full width, ~3-4x the texrects)
     /* 0x11630 */ Mtx matrixStack[0x200];
-    /* VR: the on-screen UI is emitted into this separate list so it can be
-     * rendered to its own (mono) texture and shown as a flat overlay in front of
-     * the headset's 3D screen. Placed last so no existing field offsets change. */
-    /* 0x12630 */ Gfx uiGfx[DISPLAYCONTEXT_GFX_COUNT];
-} DisplayContext; // size = 0x2A630
+} DisplayContext; // size = 0x19630
 
 typedef struct PlayerSpinState {
     /* 0x00 */ s8 stopSoundTimer;

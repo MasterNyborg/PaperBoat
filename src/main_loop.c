@@ -193,22 +193,11 @@ void gfx_task_background(void) {
                    NU_GFX_UCODE_F3DEX2, NU_SC_NOSWAPBUFFER);
 }
 
-// VR: the on-screen UI (HUD, menus, dialogue, battle UI) is emitted into its own
-// display list (DisplayContext::uiGfx) instead of mainGfx, so the port can render
-// it to a separate texture and present it as a flat layer always in front of the
-// 3D world. The game itself is unaffected.
-static Gfx* sUiGfxPos;      // current write position in the UI list
-static Gfx* sUiGfxSavedPos; // mainGfx position saved while writing UI commands
-
-#define UI_GFX_BEGIN() do { sUiGfxSavedPos = gMainGfxPos; gMainGfxPos = sUiGfxPos; } while (0)
-#define UI_GFX_END()   do { sUiGfxPos = gMainGfxPos; gMainGfxPos = sUiGfxSavedPos; } while (0)
-
 void gfx_draw_frame(void) {
     profiler_gfx_started();
 
     gMatrixListPos = 0;
     gMainGfxPos = &gDisplayContext->mainGfx[0];
-    sUiGfxPos = &gDisplayContext->uiGfx[0];
 
     if (gOverrideFlags & GLOBAL_OVERRIDES_DISABLE_DRAW_FRAME) {
         gCurrentDisplayContextIndex = gCurrentDisplayContextIndex ^ 1;
@@ -240,21 +229,15 @@ void gfx_draw_frame(void) {
     GFX_PROFILER_SWITCH(PROFILER_TIME_SUB_GFX_HUD_ELEMENTS, PROFILER_TIME_SUB_GFX_BACK_UI);
     FrameInterpolation_RecordOpenChild("gfx_back_ui", 0);
     render_screen_overlay_backUI();
-    UI_GFX_BEGIN();
     render_workers_backUI();
     render_hud_elements_backUI();
-    UI_GFX_END();
     render_effects_UI();
-    UI_GFX_BEGIN();
     render_game_mode_backUI();
-    UI_GFX_END();
     FrameInterpolation_RecordCloseChild();
 
     FrameInterpolation_RecordOpenChild("gfx_window_root", 0);
     if (!(gOverrideFlags & GLOBAL_OVERRIDES_WINDOWS_OVER_CURTAINS)) {
-        UI_GFX_BEGIN();
         render_window_root();
-        UI_GFX_END();
     }
     FrameInterpolation_RecordCloseChild();
 
@@ -262,9 +245,7 @@ void gfx_draw_frame(void) {
 
     FrameInterpolation_RecordOpenChild("gfx_world_hud", 0);
     if (!(gOverrideFlags & GLOBAL_OVERRIDES_DISABLE_RENDER_WORLD) && gGameStatusPtr->debugScripts == DEBUG_SCRIPTS_NONE) {
-        UI_GFX_BEGIN();
         render_frame(true);
-        UI_GFX_END();
     }
     FrameInterpolation_RecordCloseChild();
 
@@ -272,17 +253,13 @@ void gfx_draw_frame(void) {
     if (!(gOverrideFlags & GLOBAL_OVERRIDES_MESSAGES_OVER_CURTAINS)
         && !(gOverrideFlags & GLOBAL_OVERRIDES_MESSAGES_OVER_FRONTUI)
     ) {
-        UI_GFX_BEGIN();
         render_messages();
-        UI_GFX_END();
     }
     FrameInterpolation_RecordCloseChild();
 
     FrameInterpolation_RecordOpenChild("gfx_front_ui", 0);
-    UI_GFX_BEGIN();
     render_workers_frontUI();
     render_hud_elements_frontUI();
-    UI_GFX_END();
     render_screen_overlay_frontUI();
     FrameInterpolation_RecordCloseChild();
 
@@ -290,9 +267,7 @@ void gfx_draw_frame(void) {
     if (!(gOverrideFlags & GLOBAL_OVERRIDES_MESSAGES_OVER_CURTAINS)
         && (gOverrideFlags & GLOBAL_OVERRIDES_MESSAGES_OVER_FRONTUI)
     ) {
-        UI_GFX_BEGIN();
         render_messages();
-        UI_GFX_END();
     }
     FrameInterpolation_RecordCloseChild();
 
@@ -302,24 +277,18 @@ void gfx_draw_frame(void) {
 
     FrameInterpolation_RecordOpenChild("gfx_messages_over_curtains", 0);
     if (gOverrideFlags & GLOBAL_OVERRIDES_MESSAGES_OVER_CURTAINS) {
-        UI_GFX_BEGIN();
         render_messages();
-        UI_GFX_END();
     }
     FrameInterpolation_RecordCloseChild();
 
     FrameInterpolation_RecordOpenChild("gfx_window_over_curtains", 0);
     if (gOverrideFlags & GLOBAL_OVERRIDES_WINDOWS_OVER_CURTAINS) {
-        UI_GFX_BEGIN();
         render_window_root();
-        UI_GFX_END();
     }
     FrameInterpolation_RecordCloseChild();
 
     FrameInterpolation_RecordOpenChild("gfx_game_mode_front_ui", 0);
-    UI_GFX_BEGIN();
     render_game_mode_frontUI();
-    UI_GFX_END();
     FrameInterpolation_RecordCloseChild();
 
     if (gOverrideFlags & GLOBAL_OVERRIDES_SOFT_RESET) {
@@ -344,11 +313,6 @@ void gfx_draw_frame(void) {
 
     gDPFullSync(gMainGfxPos++);
     gSPEndDisplayList(gMainGfxPos++);
-
-    // Close the UI list (VR renders it as a separate floating layer).
-    ASSERT((s32)(sUiGfxPos - gDisplayContext->uiGfx) < ARRAY_COUNT(gDisplayContext->uiGfx));
-    gDPFullSync(sUiGfxPos++);
-    gSPEndDisplayList(sUiGfxPos++);
 
     nuGfxTaskStart(gDisplayContext->mainGfx, (u32)(gMainGfxPos - gDisplayContext->mainGfx) * 8, NU_GFX_UCODE_F3DEX2,
                    NU_SC_TASK_LODABLE | NU_SC_SWAPBUFFER);
