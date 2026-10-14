@@ -48,6 +48,8 @@
 
 #include <fast/Fast3dWindow.h>
 #include <fast/backends/gfx_direct3d_common.h>
+#include <fast/backends/gfx_window_manager_api.h>
+#include <fast/backends/gfx_dxgi.h>
 #include <fast/interpreter.h>
 #include <ship/Context.h>
 #include <ship/config/ConsoleVariable.h>
@@ -1497,19 +1499,86 @@ void PrepareOffscreen(Fast::Interpreter* interp) {
     rapi->ClearFramebuffer(true, true);
 }
 
-// Re-creates the swapchains when the game's render size changes.
+// Re-creates the swapchains (and eye targets) when VR's render size changes.
+//
+// The game derives its render size from the desktop window every frame
+// (Fast3dGui: size * dpiScale * internal_mul), so while the window is being
+// resized - or the internal-resolution slider is dragged, or the game eases the
+// widescreen aspect - mCurDimensions changes on every single frame. Rebuilding
+// the cross-process XR swapchains and the game framebuffer on each of those
+// frames costs tens of ms and shows up as frame drops, so only commit a new size
+// once it has been stable for a short while. While a change is pending we keep
+// rendering at the last committed size; the resolution cap keeps the aspect
+// fixed, so nothing visibly changes during the hold.
 void EnsureRenderTargets(Context* c, Fast::Interpreter* interp) {
     uint32_t w = interp->mCurDimensions.width;
     uint32_t h = interp->mCurDimensions.height;
     if (w < 2 || h < 2) {
         return;
     }
-    if (w != c->renderWidth || h != c->renderHeight) {
-        c->CreateSwapchains(w, h);
+
+    static uint32_t s_rtPendingW = 0;
+    static uint32_t s_rtPendingH = 0;
+    static int s_rtStableFrames = 0;
+
+    auto commit = [&](uint32_t cw, uint32_t ch) {
+        c->CreateSwapchains(cw, ch);
         // Screen aspect follows the game render aspect.
-        c->renderAspect = (float)w / (float)h;
-        c->screenSize.height = c->screenSize.width * (float)h / (float)w;
+        c->renderAspect = (float)cw / (float)ch;
+        c->screenSize.height = c->screenSize.width * (float)ch / (float)cw;
+    };
+
+    // First setup always commits immediately.
+    if (c->renderWidth == 0 || c->renderHeight == 0) {
+        commit(w, h);
+        s_rtPendingW = s_rtPendingH = 0;
+        s_rtStableFrames = 0;
+        return;
     }
+
+    if (w == c->renderWidth && h == c->renderHeight) {
+        s_rtPendingW = s_rtPendingH = 0;
+        s_rtStableFrames = 0;
+        return;
+    }
+
+    // Ignore small tweaks, e.g. the couple-of-percent height wobble the game's
+    // aspect handling produces. Rebuilding the swapchains and eye textures for a
+    // 1-2% aspect change is expensive and invisible (the blit scales anyway), so
+    // hold the committed size and keep drawing at it.
+    constexpr float kSizeTolerance = 0.05f;
+    const float dw = std::abs((float)w - (float)c->renderWidth) / (float)c->renderWidth;
+    const float dh = std::abs((float)h - (float)c->renderHeight) / (float)c->renderHeight;
+    if (dw < kSizeTolerance && dh < kSizeTolerance) {
+        interp->mCurDimensions.width = c->renderWidth;
+        interp->mCurDimensions.height = c->renderHeight;
+        s_rtPendingW = s_rtPendingH = 0;
+        s_rtStableFrames = 0;
+        return;
+    }
+
+    // RenderGameFrame runs once per interpolated sub-frame, so this is a handful
+    // of sub-frames of stability, not seconds.
+    constexpr int kStableFrames = 6;
+    if (w == s_rtPendingW && h == s_rtPendingH) {
+        ++s_rtStableFrames;
+    } else {
+        s_rtPendingW = w;
+        s_rtPendingH = h;
+        s_rtStableFrames = 0;
+    }
+
+    if (s_rtStableFrames >= kStableFrames) {
+        commit(w, h);
+        s_rtPendingW = s_rtPendingH = 0;
+        s_rtStableFrames = 0;
+        return;
+    }
+
+    // Hold the last committed size so the game framebuffer isn't reallocated
+    // mid-transition (StartFrame resizes mGameFb whenever mCurDimensions moves).
+    interp->mCurDimensions.width = c->renderWidth;
+    interp->mCurDimensions.height = c->renderHeight;
 }
 
 // ---------------------------------------------------------------------------
@@ -1733,15 +1802,22 @@ bool GetVrPad(uint16_t& buttons, int8_t& stickX, int8_t& stickY) {
 }
 
 uint32_t GetTargetFpsOverride() {
-    // This is the GAME's render rate, not the headset's: the headset is updated
-    // every display tick by PresentFrame() regardless (60 fps game content on a
-    // 120 Hz headset, each game frame delivered twice, evenly). 60 gives two
-    // sub-frames per 30 Hz game tick. PAPERBOAT_VR_FPS forces a value.
+    // This is the GAME's render rate (interpolated sub-frames per second), not
+    // the headset's: PresentFrame() still submits a frame every display tick
+    // regardless. Match the headset refresh so the game produces a fresh frame
+    // for (or faster than) every displayed frame instead of a fixed 60 - lower
+    // latency, and interpolation always has a sub-frame ready for the compositor.
+    // PAPERBOAT_VR_FPS forces a value.
     if (!VrActive()) {
         return 0;
     }
     if (int forced = EnvInt("PAPERBOAT_VR_FPS"); forced > 0) {
         return (uint32_t)forced;
+    }
+    // targetFps is latched from the runtime's predicted display period (BeginFrame)
+    // and is 0 until the first frame, so fall back to 60 until the rate is known.
+    if (g_ctx != nullptr && g_ctx->targetFps >= 60) {
+        return g_ctx->targetFps;
     }
     return 60;
 }
@@ -1787,7 +1863,10 @@ void UpdateResolutionCap(Fast::Interpreter* interp) {
         if (int forced = EnvInt("PAPERBOAT_VR_MAXW"); forced > 0) {
             cap = (float)forced;
         }
-        if (oldMul > 0.0f && curW > cap) {
+        // Only clamp when clearly over the cap. Rewriting internal_mul every
+        // frame makes the render size (and the framebuffer/swapchains that follow
+        // it) jitter, which is far more expensive than the few extra pixels.
+        if (oldMul > 0.0f && curW > cap * 1.02f) {
             float newMul = oldMul * (cap / curW);
             if (newMul < 0.05f) {
                 newMul = 0.05f;
@@ -1933,6 +2012,53 @@ void PollHotkeys() {
     }
 }
 
+// Presents the desktop window's backbuffer without ever blocking. The normal
+// present path (Fast::Interpreter::EndFrame) sleeps to the window's target FPS
+// and waits on the swapchain's frame-latency object; during VR the game tick and
+// the headset pump share this thread, so either wait can starve them and drop the
+// game framerate while the headset (fed from cached textures) stays smooth. The
+// desktop window is only a spectator mirror, so present the swapchain directly
+// with DXGI_PRESENT_DO_NOT_WAIT (a dropped mirror frame is harmless) and skip
+// both waits.
+void PresentDesktopMirror(Fast::Interpreter* interp) {
+#if defined(ENABLE_DX11) || defined(ENABLE_DX12)
+    if (interp == nullptr) {
+        return;
+    }
+    auto* dxgi = dynamic_cast<Fast::GfxWindowBackendDXGI*>(interp->mWapi);
+    if (dxgi == nullptr) {
+        return;
+    }
+    IDXGISwapChain1* sc = dxgi->GetSwapChain();
+    if (sc == nullptr) {
+        return;
+    }
+    UINT flags = DXGI_PRESENT_DO_NOT_WAIT;
+    if (dxgi->CanDisableVsync()) {
+        flags |= DXGI_PRESENT_ALLOW_TEARING;
+    }
+    HRESULT hr = sc->Present(0, flags);
+    if (hr == DXGI_ERROR_WAS_STILL_DRAWING) {
+        return; // mirror frame dropped; the queued frame stays on screen
+    }
+    if (FAILED(hr) && (flags & DXGI_PRESENT_ALLOW_TEARING)) {
+        // ALLOW_TEARING is rejected in some window modes; retry without it so the
+        // mirror keeps updating instead of silently freezing.
+        sc->Present(0, DXGI_PRESENT_DO_NOT_WAIT);
+        return;
+    }
+    if (FAILED(hr)) {
+        static bool s_warned = false;
+        if (!s_warned) {
+            s_warned = true;
+            SPDLOG_WARN("[VR] Desktop mirror present failed (0x{:08X}); mirror may not update.", (uint32_t)hr);
+        }
+    }
+#else
+    (void) interp;
+#endif
+}
+
 bool RenderGameFrame(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtxReplacements) {
     if (!g_enabled || g_ctx == nullptr || !g_ctx->initialized) {
         return false;
@@ -2005,31 +2131,30 @@ bool RenderGameFrame(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtxRep
                     g_ctx->renderHeight, g_ctx->eyes[0].width, g_ctx->eyes[0].height);
     }
 
-   // Present the desktop mirror (once per game frame; the headset is fed
+    // Present the desktop mirror (once per game frame; the headset is fed
     // separately by PresentFrame at the display rate).
     gui->EndDraw();
     const double tGui = NowMs();
-    // The desktop present is only a spectator mirror, but its built-in frame
-    // limiter (gfx_dxgi SwapBuffersBegin) blocks ~12 ms per game frame to hit the
-    // window's target FPS, which starves the headset loop and pins it to the game
-    // rate. Present it only every Nth game frame (the limiter has long elapsed by
-    // then, so it is nearly free) and use the cheap path otherwise.
-    // The desktop window mirrors the left eye. Its DXGI present is an extra
-    // GPU/display surface (which can interact with desktop overlays such as
-    // Virtual Desktop), so present it every Nth game frame: default 2 (~30 Hz
-    // mirror) so the desktop view is visible; set PAPERBOAT_VR_MIRROR=0 to turn
-    // the mirror off entirely.
+    // The desktop window mirrors the left eye. It is only a spectator view, so
+    // present it every Nth game frame: default 2 (~30 Hz mirror) so the desktop
+    // view is visible; set PAPERBOAT_VR_MIRROR=0 to turn the mirror off entirely.
+    //
+    // Flush the game+GUI draw commands that target the window backbuffer, then
+    // present the swapchain directly (see PresentDesktopMirror). We deliberately
+    // avoid Interpreter::EndFrame here: its frame-rate limiter and frame-latency
+    // wait would stall this thread, which also drives the game tick and the
+    // headset pump, dropping the game framerate while the headset stays smooth.
+    auto* rapi = interp->GetCurrentRenderingAPI();
+    rapi->EndFrame();
+    rapi->FinishRender();
+
     static const int s_mirrorPeriod = [] {
         const char* v = std::getenv("PAPERBOAT_VR_MIRROR");
         return v == nullptr ? 2 : std::max(0, std::atoi(v));
     }();
     static int s_mirrorCounter = 0;
     if (s_mirrorPeriod > 0 && (++s_mirrorCounter % s_mirrorPeriod) == 0) {
-        interp->EndFrame();
-    } else {
-        auto* rapi = interp->GetCurrentRenderingAPI();
-        rapi->EndFrame();
-        rapi->FinishRender();
+        PresentDesktopMirror(interp);
     }
     const double tEnd = NowMs();
 

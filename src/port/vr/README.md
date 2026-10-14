@@ -50,14 +50,20 @@ presentation comfortably holds the display rate.
 
 ### Frame pacing / latency notes
 
-- `GetTargetFpsOverride()` returns **60** (the *game* content rate), so the port
-  interpolates 2 sub-frames per 30 Hz logic tick. `PresentFrame` still submits at
-  the full display rate.
+- `GetTargetFpsOverride()` returns the **headset refresh rate** (Hz) once the
+  runtime reports it (latched from `predictedDisplayPeriod`; 60 until then), so
+  the game renders at the display rate (or faster) rather than a fixed 60 and the
+  compositor gets a fresh frame each tick. `PAPERBOAT_VR_FPS` forces a value.
+  `PresentFrame` still submits at the full display rate.
 - The port's own **desktop present** (`Interpreter::EndFrame`) contains a frame
-  limiter (`gfx_dxgi.cpp` `SwapBuffersBegin`) that blocks ~12 ms to hit the
-  window's target FPS. During VR it would starve the headset loop, so it is
-  presented only every Nth game frame (a cheap spectator mirror); the other
-  frames use the cheap `EndFrame`/`FinishRender` path.
+  limiter (`gfx_dxgi.cpp` `SwapBuffersBegin`) and a frame-latency wait
+  (`SwapBuffersEnd`) that together block ~12 ms to hit the window's target FPS.
+  During VR the desktop window is only a spectator mirror and must never pace the
+  game, so its present is decoupled from `Interpreter::EndFrame`: the frame is
+  flushed normally, then the swapchain is presented directly with
+  `DXGI_PRESENT_DO_NOT_WAIT` (`PresentDesktopMirror`, no pacing, no latency
+  wait) — a dropped mirror frame is harmless. It is presented every Nth game
+  frame (default 2) and skipped otherwise.
 - `VrDebugEnabled()` also forces the render path when the session is not
   focused, for headset-free testing.
 
@@ -106,13 +112,20 @@ called, so they survive restarts and work even with no headset attached.
 | `PAPERBOAT_VR_FPS=N` | Force the game's interpolation target (content) rate. |
 | `PAPERBOAT_VR_RESSCALE=F` | Scale the per-eye render-resolution cap. |
 | `PAPERBOAT_VR_MAXW=N` | Absolute per-eye render-width cap (px). |
-| `PAPERBOAT_VR_MIRROR=N` | Desktop spectator-mirror period in game frames (default 2 = ~30 Hz; 0 disables). Do **not** use 1: presenting every game frame re-engages the ~12 ms present limiter and pins the headset to the game rate. |
+| `PAPERBOAT_VR_MIRROR=N` | Desktop spectator-mirror period in game frames (default 2 = ~30 Hz; 0 disables). The present is non-blocking, so any period is safe now. |
 
 ## Tuning / gotchas
 
 - **Render size**: `kMaxEyeRenderWidth` (default 1280 px per eye) caps the game
   render resolution; the blit upscales it to the HMD swapchain. Raise it for
   sharpness (there is headroom), lower it if VR performance suffers.
+- **Render-size changes are debounced:** the game's render size follows the
+  desktop window (`size * dpiScale * internal_mul`) and can change every frame
+  while the window is resized or the internal-resolution slider is dragged.
+  Rebuilding the XR swapchains and the game framebuffer each frame is very
+  expensive, so `EnsureRenderTargets` only commits a new size once it has been
+  stable for a few sub-frames and holds the last committed size meanwhile. The
+  resolution cap has 2% hysteresis for the same reason.
 - **Stereo sign/axis:** if depth looks inverted or left/right are swapped, flip
   the sign of the offset passed in `RenderGameFrame` (`+half` / `-half`). The
   horizontal eye axis is eye-space X; a canted-display HMD may need a different
