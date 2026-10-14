@@ -99,7 +99,6 @@ constexpr float kMaxEyeRenderWidth = 1280.0f;  // per-eye render width cap
 constexpr float kScreenSizeStep = 0.1f;
 constexpr float kScreenDistanceStep = 0.1f;
 constexpr float kStereoStep = 0.25f;
-constexpr float kConvergenceStep = 0.005f;
 
 // The three perspective gameplay cameras (CAM_DEFAULT/CAM_BATTLE/CAM_TATTLE).
 // CAM_HUD (3, orthographic) is intentionally left mono.
@@ -353,14 +352,14 @@ bool g_enabled = true;
 float g_screenWidth = kDefaultScreenSize; // metres
 float g_screenDistance = kDefaultScreenDistance;
 float g_stereoStrength = kDefaultStereoStrength;
-// User trim (NDC) added to the auto zero-parallax shift. Positive moves the
-// zero-parallax plane nearer (scene recedes further behind the UI).
+// User trim (NDC) added to the auto zero-parallax shift. Fixed at 0: the menu
+// control was removed, so the zero-parallax plane stays on the camera target.
 float g_convergence = 0.0f;
 // Per-eye horizontal shift (pixels) applied to the background so it reads as
 // distant. Left eye gets -g_bgParallaxPx, right eye +g_bgParallaxPx (a point
 // behind the zero-parallax plane has its left view shifted left, right view
 // right). 0 = background stays mono.
-int g_bgParallaxPx = 4;
+int g_bgParallaxPx = 2;
 
 // Watchdog for a runtime that stopped presenting (headset asleep/disconnected).
 // If an XR frame takes pathologically long, or the swapchains stop being handed
@@ -1597,7 +1596,6 @@ constexpr const char* kCvarEnabled = "gVR.Enabled";
 constexpr const char* kCvarScreenSize = "gVR.ScreenSize";
 constexpr const char* kCvarScreenDistance = "gVR.ScreenDistance";
 constexpr const char* kCvarStereoStrength = "gVR.StereoStrength";
-constexpr const char* kCvarConvergence = "gVR.Convergence";
 constexpr const char* kCvarBackgroundParallax = "gVR.BackgroundParallax";
 
 // Reads a float CVar in a type-tolerant way. The port's CVarGetFloat returns the
@@ -1640,8 +1638,7 @@ void LoadSettings() {
     g_screenWidth = CvarFloat(kCvarScreenSize, kDefaultScreenSize);
     g_screenDistance = CvarFloat(kCvarScreenDistance, kDefaultScreenDistance);
     g_stereoStrength = CvarFloat(kCvarStereoStrength, kDefaultStereoStrength);
-    g_convergence = CvarFloat(kCvarConvergence, 0.0f);
-    g_bgParallaxPx = (int)CvarFloat(kCvarBackgroundParallax, 4.0f);
+    g_bgParallaxPx = (int)CvarFloat(kCvarBackgroundParallax, 2.0f);
     SPDLOG_INFO("[VR] Settings loaded: enabled={} screenSize={:.2f}m distance={:.2f}m stereo={:.2f}", g_enabled,
                 g_screenWidth, g_screenDistance, g_stereoStrength);
 }
@@ -1862,19 +1859,17 @@ void ReloadSettings() {
     const float size = CvarFloat(kCvarScreenSize, kDefaultScreenSize);
     const float dist = CvarFloat(kCvarScreenDistance, kDefaultScreenDistance);
     const float stereo = CvarFloat(kCvarStereoStrength, kDefaultStereoStrength);
-    const float converge = CvarFloat(kCvarConvergence, 0.0f);
-    const int bgParallax = (int)CvarFloat(kCvarBackgroundParallax, 4.0f);
+    const int bgParallax = (int)CvarFloat(kCvarBackgroundParallax, 2.0f);
     // The settings menu fires its callback every frame, so only apply (and log)
     // when something actually changed.
     if (enabled == g_enabled && size == g_screenWidth && dist == g_screenDistance && stereo == g_stereoStrength &&
-        converge == g_convergence && bgParallax == g_bgParallaxPx) {
+        bgParallax == g_bgParallaxPx) {
         return;
     }
     g_enabled = enabled;
     g_screenWidth = size;
     g_screenDistance = dist;
     g_stereoStrength = stereo;
-    g_convergence = converge;
     g_bgParallaxPx = std::clamp(bgParallax, 0, 64);
     if (g_ctx != nullptr) {
         const float aspect = g_ctx->renderWidth > 0 ? (float)g_ctx->renderHeight / (float)g_ctx->renderWidth : 0.75f;
@@ -1897,13 +1892,11 @@ void SetStereoStrength(float strength) {
 }
 
 float GetConvergence() {
-    LoadSettings();
     return g_convergence;
 }
-void SetConvergence(float ndc) {
-    LoadSettings();
-    g_convergence = std::clamp(ndc, -0.5f, 0.5f);
-    CVarSetFloat(kCvarConvergence, g_convergence);
+void SetConvergence(float) {
+    // Zero-parallax trim is intentionally fixed at 0; the menu control was
+    // removed. Kept as a no-op for API compatibility.
 }
 
 void PollHotkeys() {
@@ -1937,14 +1930,6 @@ void PollHotkeys() {
     if (KeyEdge(VK_OEM_PERIOD)) {
         SetStereoStrength(GetStereoStrength() + kStereoStep);
         SPDLOG_INFO("[VR] Stereo strength {}.", GetStereoStrength());
-    }
-    if (KeyEdge(VK_OEM_MINUS)) {
-        SetConvergence(GetConvergence() - kConvergenceStep);
-        SPDLOG_INFO("[VR] Zero-parallax trim {}.", GetConvergence());
-    }
-    if (KeyEdge(VK_OEM_PLUS)) {
-        SetConvergence(GetConvergence() + kConvergenceStep);
-        SPDLOG_INFO("[VR] Zero-parallax trim {}.", GetConvergence());
     }
 }
 

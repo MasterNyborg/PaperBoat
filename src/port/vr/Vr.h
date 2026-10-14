@@ -81,8 +81,8 @@ float GetScreenDistance();        // metres in front of the head
 void SetScreenDistance(float metres);
 float GetStereoStrength();        // half-IPD in game world units
 void SetStereoStrength(float strength);
-float GetConvergence();           // zero-parallax trim (NDC); positive = nearer plane
-void SetConvergence(float ndc);
+float GetConvergence();           // zero-parallax trim; fixed at 0 in this build
+void SetConvergence(float ndc);   // no-op (trim is fixed at 0)
 
 // Re-reads the persisted settings (gVR.* CVars) and applies them live. The
 // settings menu widgets write the CVars directly and call this.
