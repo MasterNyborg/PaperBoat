@@ -39,10 +39,13 @@ or the compositor stutters. So rendering and presentation are decoupled:
    even though the game only renders 60 times a second.
 
 The blit is a fullscreen draw (`Blitter`, shaders compiled from
-`d3dcompiler_47.dll`) because the runtime usually only offers an *sRGB*
-swapchain format while the game FB is linear RGBA8, and the eye texture size may
-differ from the swapchain size. `mGfxFrameBuffer` is copied into `eyeTex[e]`
-first (a `CopyResource` when sizes/formats match, else a blit).
+`d3dcompiler_47.dll`) because the swapchain format and the eye texture size may
+differ. The game FB holds display-referred (sRGB-encoded) bytes: an *sRGB*
+swapchain is preferred and the bytes are written verbatim through its UNORM view,
+while a linear *UNORM* swapchain makes the blit decode sRGB -> linear (otherwise
+the compositor shows the image too bright and washed out). `mGfxFrameBuffer` is
+copied into `eyeTex[e]` first (a `CopyResource` when sizes/formats match, else a
+blit).
 
 Measured on a Quest 3-class setup: game render ≈ 0.6–2 ms per eye-pair, blit
 ≈ 0.03 ms, `xrWaitFrame` ≈ 7 ms (paces to 120 Hz), `xrEndFrame` ≈ 0.4 ms — i.e.

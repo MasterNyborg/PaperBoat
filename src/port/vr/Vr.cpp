@@ -124,6 +124,11 @@ struct EyeSwapchain {
     bool acquired = false;
 };
 
+// True for swapchain formats whose values are sRGB-encoded (display-referred).
+bool IsSrgbFormat(int64_t format) {
+    return format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB || format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+}
+
 // Minimal D3D11 fullscreen blitter. The HMD swapchain format often doesn't
 // match the game's framebuffer format (e.g. sRGB vs linear RGBA8), and the
 // sizes may differ, so we can't CopyResource. This draws the game texture onto
@@ -155,15 +160,32 @@ class Blitter {
                                  "float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {\n"
                                  "  return tex.Sample(smp, uv);\n"
                                  "}";
+        // For a linear (UNORM) swapchain: decode the game's sRGB bytes so the
+        // compositor's linear pipeline reproduces the intended brightness.
+        static const char* kPsDecode = "Texture2D tex : register(t0);\n"
+                                       "SamplerState smp : register(s0);\n"
+                                       "float3 toLinear(float3 c) {\n"
+                                       "  float3 lo = c / 12.92;\n"
+                                       "  float3 hi = pow(saturate((c + 0.055) / 1.055), 2.4);\n"
+                                       "  return lerp(hi, lo, step(c, 0.04045));\n"
+                                       "}\n"
+                                       "float4 main(float4 pos : SV_Position, float2 uv : TEXCOORD0) : SV_Target {\n"
+                                       "  float4 c = tex.Sample(smp, uv);\n"
+                                       "  return float4(toLinear(c.rgb), c.a);\n"
+                                       "}\n";
 
-        ComPtr<ID3DBlob> vsBlob, psBlob, err;
+        ComPtr<ID3DBlob> vsBlob, psBlob, psDecodeBlob, err;
         if (FAILED(compile(kVs, strlen(kVs), nullptr, nullptr, nullptr, "main", "vs_5_0", 0, 0, &vsBlob, &err)) ||
-            FAILED(compile(kPs, strlen(kPs), nullptr, nullptr, nullptr, "main", "ps_5_0", 0, 0, &psBlob, &err))) {
+            FAILED(compile(kPs, strlen(kPs), nullptr, nullptr, nullptr, "main", "ps_5_0", 0, 0, &psBlob, &err)) ||
+            FAILED(compile(kPsDecode, strlen(kPsDecode), nullptr, nullptr, nullptr, "main", "ps_5_0", 0, 0,
+                           &psDecodeBlob, &err))) {
             SPDLOG_WARN("[VR] Shader compilation failed; falling back to CopyResource.");
             return false;
         }
         if (FAILED(device->CreateVertexShader(vsBlob->GetBufferPointer(), vsBlob->GetBufferSize(), nullptr, &vs)) ||
-            FAILED(device->CreatePixelShader(psBlob->GetBufferPointer(), psBlob->GetBufferSize(), nullptr, &ps))) {
+            FAILED(device->CreatePixelShader(psBlob->GetBufferPointer(), psBlob->GetBufferSize(), nullptr, &ps)) ||
+            FAILED(device->CreatePixelShader(psDecodeBlob->GetBufferPointer(), psDecodeBlob->GetBufferSize(), nullptr,
+                                             &psDecode))) {
             return false;
         }
 
@@ -203,7 +225,7 @@ class Blitter {
     bool ready = false;
 
     void Blit(ID3D11Device* device, ID3D11DeviceContext* ctx, ID3D11ShaderResourceView* srv,
-              ID3D11Texture2D* dst, DXGI_FORMAT dstFormat, uint32_t dstW, uint32_t dstH) {
+              ID3D11Texture2D* dst, DXGI_FORMAT dstFormat, uint32_t dstW, uint32_t dstH, bool decodeSrgb = false) {
         if (!ready || !srv || !dst) {
             return;
         }
@@ -236,7 +258,7 @@ class Blitter {
         ctx->IASetInputLayout(nullptr);
         ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         ctx->VSSetShader(vs.Get(), nullptr, 0);
-        ctx->PSSetShader(ps.Get(), nullptr, 0);
+        ctx->PSSetShader(decodeSrgb ? psDecode.Get() : ps.Get(), nullptr, 0);
         ctx->PSSetShaderResources(0, 1, &srv);
         ctx->PSSetSamplers(0, 1, sampler.GetAddressOf());
         ctx->Draw(3, 0);
@@ -250,6 +272,7 @@ class Blitter {
                                             LPCSTR, UINT, UINT, ID3DBlob**, ID3DBlob**);
     ComPtr<ID3D11VertexShader> vs;
     ComPtr<ID3D11PixelShader> ps;
+    ComPtr<ID3D11PixelShader> psDecode;
     ComPtr<ID3D11SamplerState> sampler;
     ComPtr<ID3D11RasterizerState> raster;
     ComPtr<ID3D11DepthStencilState> depthOff;
@@ -898,18 +921,45 @@ bool Context::CreateSwapchains(uint32_t width, uint32_t height) {
         xrEnumerateSwapchainFormats(session, fmtCount, &fmtCount, formats.data());
     }
 
+    // The game framebuffer holds display-referred (sRGB-encoded) bytes. Prefer an
+    // sRGB swapchain so those bytes can be stored verbatim (the blit uses the
+    // UNORM view to avoid a second encode). A linear UNORM swapchain is the
+    // fallback: the blit then decodes sRGB -> linear, because the compositor
+    // treats UNORM values as linear and would otherwise show them too bright and
+    // washed out.
     int64_t chosenFormat = 0;
+    const int64_t kSrgbFormats[] = { DXGI_FORMAT_R8G8B8A8_UNORM_SRGB, DXGI_FORMAT_B8G8R8A8_UNORM_SRGB };
+    const int64_t kLinearFormats[] = { DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_B8G8R8A8_UNORM };
     bool found = false;
-    for (int64_t f : formats) {
-        if (f == DXGI_FORMAT_R8G8B8A8_UNORM) {
-            chosenFormat = f;
-            found = true;
+    for (int64_t want : kSrgbFormats) {
+        for (int64_t f : formats) {
+            if (f == want) {
+                chosenFormat = f;
+                found = true;
+                break;
+            }
+        }
+        if (found) {
             break;
         }
     }
     if (!found) {
-        chosenFormat = formats.empty() ? DXGI_FORMAT_R8G8B8A8_UNORM : formats[0];
-        SPDLOG_WARN("[VR] Runtime did not offer DXGI_FORMAT_R8G8B8A8_UNORM; using format {}. Colour may be off.",
+        for (int64_t want : kLinearFormats) {
+            for (int64_t f : formats) {
+                if (f == want) {
+                    chosenFormat = f;
+                    found = true;
+                    break;
+                }
+            }
+            if (found) {
+                break;
+            }
+        }
+    }
+    if (!found) {
+        chosenFormat = formats.empty() ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB : formats[0];
+        SPDLOG_WARN("[VR] Runtime offered no R8G8B8A8/B8G8R8A8 format; using format {}. Colour may be off.",
                     chosenFormat);
     }
 
@@ -1256,10 +1306,11 @@ void Context::EndFrame(bool submitContent) {
 // ---------------------------------------------------------------------------
 
 // The game framebuffer holds display-referred (already sRGB-encoded) bytes, and
-// the desktop path shows them verbatim on a UNORM swapchain. The XR swapchain is
-// sRGB, so rendering with an sRGB target view would encode them a second time
-// (washed out). Use the UNORM view of the (typeless) swapchain texture instead
-// so the bytes are stored verbatim.
+// the desktop path shows them verbatim on a UNORM swapchain. On an sRGB XR
+// swapchain, rendering with an sRGB target view would encode them a second time
+// (washed out), so use the UNORM view of the (typeless) swapchain texture and
+// store the bytes verbatim. On a linear UNORM XR swapchain the blit decodes
+// sRGB -> linear instead; see BlitEyeTexToSwapchain.
 DXGI_FORMAT UnormViewFormat(int64_t fmt) {
     switch (fmt) {
         case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
@@ -1309,8 +1360,11 @@ void BlitEyeTexToSwapchain(Context* c, int eye) {
     if (!dst) {
         return;
     }
+    // sRGB swapchain: write the game's display-referred bytes verbatim through
+    // its UNORM view (no double encode). Linear UNORM swapchain: decode them so
+    // the compositor sees linear light instead of washed-out sRGB values.
     c->blitter.Blit(c->Device(), c->DeviceContext(), c->eyeSrv[eye].Get(), dst, UnormViewFormat(sc.format), sc.width,
-                    sc.height);
+                    sc.height, !IsSrgbFormat(sc.format));
 }
 
 // Converts a packed N64 fixed-point matrix to floats, using the exact layout the
