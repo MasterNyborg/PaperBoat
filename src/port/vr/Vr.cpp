@@ -56,6 +56,9 @@
 #include <ship/window/Window.h>
 #include <ship/window/gui/Gui.h>
 
+#include <imgui.h>
+#include <imgui_impl_dx11.h>
+
 #include <spdlog/spdlog.h>
 
 #include "Engine.h" // OTRGetGameRenderWidth/Height / OTRGetAspectRatio
@@ -219,6 +222,21 @@ class Blitter {
             return false;
         }
 
+        // "over" blend for premultiplied-alpha sources (the ImGui menu texture):
+        //   out = src + dst * (1 - src.a)
+        D3D11_BLEND_DESC pb{};
+        pb.RenderTarget[0].BlendEnable = TRUE;
+        pb.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
+        pb.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+        pb.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+        pb.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+        pb.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
+        pb.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+        pb.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+        if (FAILED(device->CreateBlendState(&pb, &blendPremul))) {
+            return false;
+        }
+
         ready = true;
         return true;
     }
@@ -226,7 +244,8 @@ class Blitter {
     bool ready = false;
 
     void Blit(ID3D11Device* device, ID3D11DeviceContext* ctx, ID3D11ShaderResourceView* srv,
-              ID3D11Texture2D* dst, DXGI_FORMAT dstFormat, uint32_t dstW, uint32_t dstH, bool decodeSrgb = false) {
+              ID3D11Texture2D* dst, DXGI_FORMAT dstFormat, uint32_t dstW, uint32_t dstH, bool decodeSrgb = false,
+              bool premul = false) {
         if (!ready || !srv || !dst) {
             return;
         }
@@ -253,7 +272,7 @@ class Blitter {
         ID3D11RenderTargetView* rtvRaw = rtv.Get();
         ctx->OMSetRenderTargets(1, &rtvRaw, nullptr);
         ctx->OMSetDepthStencilState(depthOff.Get(), 0);
-        ctx->OMSetBlendState(blendOpaque.Get(), nullptr, 0xffffffff);
+        ctx->OMSetBlendState(premul ? blendPremul.Get() : blendOpaque.Get(), nullptr, 0xffffffff);
         ctx->RSSetState(raster.Get());
         ctx->RSSetViewports(1, &vp);
         ctx->IASetInputLayout(nullptr);
@@ -278,6 +297,7 @@ class Blitter {
     ComPtr<ID3D11RasterizerState> raster;
     ComPtr<ID3D11DepthStencilState> depthOff;
     ComPtr<ID3D11BlendState> blendOpaque;
+    ComPtr<ID3D11BlendState> blendPremul;
 };
 
 class Context {
@@ -322,6 +342,7 @@ class Context {
     XrAction actStart = XR_NULL_HANDLE;
     XrAction actStick = XR_NULL_HANDLE;
     XrAction actCStick = XR_NULL_HANDLE;
+    XrAction actMenu = XR_NULL_HANDLE;
     uint16_t vrButtons = 0;
     int8_t vrStickX = 0;
     int8_t vrStickY = 0;
@@ -338,6 +359,14 @@ class Context {
     // them into the XR swapchains at the headset rate (decoupled frame delivery).
     ComPtr<ID3D11Texture2D> eyeTex[2];
     ComPtr<ID3D11ShaderResourceView> eyeSrv[2];
+    // Offscreen ImGui frame. Rendering the port menu at the desktop window
+    // resolution keeps the DX11 backend's viewport/ortho consistent; it is then
+    // scaled over both (smaller) eye textures for the headset.
+    ComPtr<ID3D11Texture2D> menuTex;
+    ComPtr<ID3D11ShaderResourceView> menuSrv;
+    ComPtr<ID3D11RenderTargetView> menuRtv;
+    uint32_t menuWidth = 0;
+    uint32_t menuHeight = 0;
     XrPosef screenPose{ { 0, 0, 0, 1 }, { 0, 0, -kDefaultScreenDistance } };
     XrExtent2Df screenSize{ kDefaultScreenSize, kDefaultScreenSize * 0.75f };
     // The screen sits on the ray (anchor + dir * distance), captured at recenter.
@@ -348,6 +377,8 @@ class Context {
 
     bool CreateSwapchains(uint32_t width, uint32_t height);
     void CreateEyeTextures(uint32_t width, uint32_t height);
+    bool EnsureMenuTexture(uint32_t w, uint32_t h);
+    void CompositeUiToEyes();
     ID3D11DeviceContext* DeviceContext() const {
         return context;
     }
@@ -390,6 +421,117 @@ float g_convergence = 0.0f;
 // behind the zero-parallax plane has its left view shifted left, right view
 // right). 0 = background stays mono.
 int g_bgParallaxPx = 2;
+
+// ---------------------------------------------------------------------------
+// In-headset ImGui menu
+// ---------------------------------------------------------------------------
+constexpr const char* kCvarControlNav = "gSettings.ControlNav";
+constexpr int32_t kVrMenuInputBlockId = 95237930;
+
+// True while the port menu is open in VR. Read by GetVrPad on the SI thread, so
+// it must be atomic.
+std::atomic<bool> g_vrMenuInputBlock{ false };
+
+bool PortMenuOpen(Ship::Gui* gui) {
+    return gui != nullptr && (gui->GetMenuOrMenubarVisible() ||
+                              ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel));
+}
+
+void UpdateVrInputBlock(bool block);
+
+// Toggles the port's ImGui menu (same target the keyboard/controller toggle hits).
+void TogglePortMenu() {
+    auto ship = Ship::Context::GetRawInstance();
+    if (ship == nullptr || ship->GetWindow() == nullptr) {
+        return;
+    }
+    auto gui = ship->GetWindow()->GetGui();
+    if (gui == nullptr) {
+        return;
+    }
+    if (gui->GetMenu()) {
+        gui->GetMenu()->ToggleVisibility();
+    } else if (gui->GetMenuBar()) {
+        gui->GetMenuBar()->ToggleVisibility();
+    }
+    gui->UpdateGamepadNavigation();
+    // Block/unblock immediately so the enabling grip press cannot leak into the
+    // game before the next render frame.
+    UpdateVrInputBlock(gui->GetMenuOrMenubarVisible());
+}
+
+// Blocks (or unblocks) game input while the VR menu is being used, so menu
+// button presses and stick movement cannot leak into the game underneath.
+void UpdateVrInputBlock(bool block) {
+    g_vrMenuInputBlock.store(block, std::memory_order_relaxed);
+    static bool applied = false;
+    if (block == applied) {
+        return;
+    }
+    applied = block;
+    auto ship = Ship::Context::GetRawInstance();
+    if (ship == nullptr || ship->GetControlDeck() == nullptr) {
+        return;
+    }
+    if (block) {
+        ship->GetControlDeck()->BlockGameInput(kVrMenuInputBlockId);
+    } else {
+        ship->GetControlDeck()->UnblockGameInput(kVrMenuInputBlockId);
+    }
+}
+
+struct VrImGuiKeys {
+    bool up = false;
+    bool down = false;
+    bool left = false;
+    bool right = false;
+    bool activate = false;
+    bool cancel = false;
+    bool start = false;
+};
+VrImGuiKeys g_vrImGuiKeys;
+
+void SendVrImGuiKey(ImGuiKey key, bool& previous, bool next) {
+    if (previous == next) {
+        return;
+    }
+    previous = next;
+    ImGui::GetIO().AddKeyEvent(key, next);
+}
+
+// Feeds the VR controllers into ImGui as a virtual gamepad. Must run before the
+// ImGui frame is built (Gui::StartDraw). Gamepad navigation is forced on while
+// the port menu is visible, independent of the desktop "Menu Controller
+// Navigation" setting.
+void InjectVrImGuiInput(bool menuOpen) {
+    ImGuiIO& io = ImGui::GetIO();
+    io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
+    if (menuOpen) {
+        // Set it before ImGui::NewFrame so nav is live on the same frame the
+        // menu opens, not one frame later.
+        io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
+    }
+
+    bool up = false, down = false, left = false, right = false;
+    bool activate = false, cancel = false, start = false;
+    if (menuOpen && g_ctx != nullptr && g_ctx->sessionRunning) {
+        constexpr int kDeadzone = 40; // 0.5 * the -80..80 N64 stick range
+        up = g_ctx->vrStickY > kDeadzone;
+        down = g_ctx->vrStickY < -kDeadzone;
+        left = g_ctx->vrStickX < -kDeadzone;
+        right = g_ctx->vrStickX > kDeadzone;
+        activate = (g_ctx->vrButtons & 0x8000) != 0; // A
+        cancel = (g_ctx->vrButtons & 0x4000) != 0;   // B
+        start = (g_ctx->vrButtons & 0x1000) != 0;    // Start
+    }
+    SendVrImGuiKey(ImGuiKey_GamepadDpadUp, g_vrImGuiKeys.up, up);
+    SendVrImGuiKey(ImGuiKey_GamepadDpadDown, g_vrImGuiKeys.down, down);
+    SendVrImGuiKey(ImGuiKey_GamepadDpadLeft, g_vrImGuiKeys.left, left);
+    SendVrImGuiKey(ImGuiKey_GamepadDpadRight, g_vrImGuiKeys.right, right);
+    SendVrImGuiKey(ImGuiKey_GamepadFaceDown, g_vrImGuiKeys.activate, activate);
+    SendVrImGuiKey(ImGuiKey_GamepadFaceRight, g_vrImGuiKeys.cancel, cancel);
+    SendVrImGuiKey(ImGuiKey_GamepadStart, g_vrImGuiKeys.start, start);
+}
 
 // Watchdog for a runtime that stopped presenting (headset asleep/disconnected).
 // If an XR frame takes pathologically long, or the swapchains stop being handed
@@ -766,6 +908,7 @@ bool Context::CreateActions() {
     actStart = makeAction("start", "Start", XR_ACTION_TYPE_BOOLEAN_INPUT);
     actStick = makeAction("stick", "Stick", XR_ACTION_TYPE_VECTOR2F_INPUT);
     actCStick = makeAction("cstick", "C-Stick", XR_ACTION_TYPE_VECTOR2F_INPUT);
+    actMenu = makeAction("menu", "Menu", XR_ACTION_TYPE_BOOLEAN_INPUT);
 
     auto pathOf = [this](const char* s) -> XrPath {
         XrPath p = XR_NULL_PATH;
@@ -796,7 +939,8 @@ bool Context::CreateActions() {
               { actZ, "/user/hand/left/input/trigger/click" },
               { actStart, "/user/hand/left/input/menu/click" },
               { actStick, "/user/hand/left/input/thumbstick" },
-              { actCStick, "/user/hand/right/input/thumbstick" } });
+              { actCStick, "/user/hand/right/input/thumbstick" },
+              { actMenu, "/user/hand/left/input/squeeze/click" } });
 
     // Valve Index
     suggest("/interaction_profiles/valve/index_controller",
@@ -805,7 +949,8 @@ bool Context::CreateActions() {
               { actZ, "/user/hand/left/input/trigger/click" },
               { actStart, "/user/hand/left/input/thumbstick/click" },
               { actStick, "/user/hand/left/input/thumbstick" },
-              { actCStick, "/user/hand/right/input/thumbstick" } });
+              { actCStick, "/user/hand/right/input/thumbstick" },
+              { actMenu, "/user/hand/left/input/squeeze/click" } });
 
     // Microsoft Mixed Reality
     suggest("/interaction_profiles/microsoft/motion_controller",
@@ -814,13 +959,15 @@ bool Context::CreateActions() {
               { actZ, "/user/hand/left/input/trigger/click" },
               { actStart, "/user/hand/left/input/menu/click" },
               { actStick, "/user/hand/left/input/thumbstick" },
-              { actCStick, "/user/hand/right/input/thumbstick" } });
+              { actCStick, "/user/hand/right/input/thumbstick" },
+              { actMenu, "/user/hand/left/input/squeeze/click" } });
 
     // KHR Simple (fallback: buttons only, no sticks)
     suggest("/interaction_profiles/khr/simple_controller",
             { { actA, "/user/hand/right/input/select/click" },
               { actB, "/user/hand/left/input/select/click" },
-              { actStart, "/user/hand/left/input/menu/click" } });
+              { actStart, "/user/hand/left/input/menu/click" },
+              { actMenu, "/user/hand/right/input/menu/click" } });
 
     XrSessionActionSetsAttachInfo attach{ XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO };
     attach.countActionSets = 1;
@@ -885,6 +1032,15 @@ void Context::SyncActions() {
     if (boolState(actStart)) {
         b |= 0x1000; // START_BUTTON
     }
+
+    // Left grip toggles the port's ImGui menu. Edge-triggered so holding the grip
+    // does not reopen the menu after it is closed from inside.
+    static bool menuPrev = false;
+    const bool menuNow = boolState(actMenu);
+    if (menuNow && !menuPrev) {
+        TogglePortMenu();
+    }
+    menuPrev = menuNow;
 
     XrVector2f ls{}, rs{};
     const bool lsActive = vecState(actStick, ls);
@@ -1025,10 +1181,53 @@ void Context::CreateEyeTextures(uint32_t width, uint32_t height) {
         desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM; // matches the game framebuffer
         desc.SampleDesc.Count = 1;
         desc.Usage = D3D11_USAGE_DEFAULT;
-        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        // Render target so the ImGui menu can be composited onto the eye texture.
+        desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
         if (SUCCEEDED(device->CreateTexture2D(&desc, nullptr, eyeTex[e].GetAddressOf()))) {
             device->CreateShaderResourceView(eyeTex[e].Get(), nullptr, eyeSrv[e].GetAddressOf());
         }
+    }
+}
+
+// (Re)creates the offscreen menu texture at the desktop window resolution.
+bool Context::EnsureMenuTexture(uint32_t w, uint32_t h) {
+    if (w < 2 || h < 2 || !device) {
+        return false;
+    }
+    if (menuTex && menuWidth == w && menuHeight == h) {
+        return menuRtv != nullptr && menuSrv != nullptr;
+    }
+    menuSrv.Reset();
+    menuRtv.Reset();
+    menuTex.Reset();
+    menuWidth = w;
+    menuHeight = h;
+    D3D11_TEXTURE2D_DESC desc{};
+    desc.Width = w;
+    desc.Height = h;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+    if (FAILED(device->CreateTexture2D(&desc, nullptr, menuTex.GetAddressOf()))) {
+        return false;
+    }
+    device->CreateShaderResourceView(menuTex.Get(), nullptr, menuSrv.GetAddressOf());
+    device->CreateRenderTargetView(menuTex.Get(), nullptr, menuRtv.GetAddressOf());
+    return menuRtv != nullptr && menuSrv != nullptr;
+}
+
+// Composites the offscreen ImGui menu (premultiplied alpha) over both eye
+// textures, scaling it from the window resolution to the eye resolution.
+void Context::CompositeUiToEyes() {
+    if (!menuSrv || !eyeTex[0] || !eyeTex[1] || renderWidth < 2 || renderHeight < 2) {
+        return;
+    }
+    for (int e = 0; e < 2; ++e) {
+        blitter.Blit(device, context, menuSrv.Get(), eyeTex[e].Get(), DXGI_FORMAT_R8G8B8A8_UNORM, renderWidth,
+                     renderHeight, /*decodeSrgb=*/false, /*premul=*/true);
     }
 }
 
@@ -1104,6 +1303,11 @@ void Context::Shutdown() {
         return;
     }
     DestroySwapchains();
+    menuSrv.Reset();
+    menuRtv.Reset();
+    menuTex.Reset();
+    menuWidth = 0;
+    menuHeight = 0;
     if (viewSpace != XR_NULL_HANDLE) {
         xrDestroySpace(viewSpace);
         viewSpace = XR_NULL_HANDLE;
@@ -1812,6 +2016,7 @@ bool Initialize() {
 
 void Shutdown() {
     StopWatchdog();
+    UpdateVrInputBlock(false);
     if (g_ctx != nullptr) {
         g_ctx->Shutdown();
         delete g_ctx;
@@ -1854,11 +2059,22 @@ void SetEnabled(bool enabled) {
     LoadSettings();
     g_enabled = enabled;
     CVarSetInteger(kCvarEnabled, enabled ? 1 : 0);
+    if (!enabled) {
+        // VR is off: make sure we are not still blocking game input for the menu.
+        UpdateVrInputBlock(false);
+    }
 }
 
 bool GetVrPad(uint16_t& buttons, int8_t& stickX, int8_t& stickY) {
     if (g_ctx == nullptr || !g_ctx->sessionRunning) {
         return false;
+    }
+    // While the VR menu is open the controllers drive it, so report no game input.
+    if (g_vrMenuInputBlock.load(std::memory_order_relaxed)) {
+        buttons = 0;
+        stickX = 0;
+        stickY = 0;
+        return true;
     }
     buttons = g_ctx->vrButtons;
     stickX = g_ctx->vrStickX;
@@ -2175,6 +2391,8 @@ bool RenderGameFrame(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtxRep
     }
     if (!visible) {
         // Let the normal desktop path draw; PresentFrame() keeps the session fed.
+        UpdateVrInputBlock(false);
+        InjectVrImGuiInput(false);
         return false;
     }
 
@@ -2195,7 +2413,19 @@ bool RenderGameFrame(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtxRep
 
     // StartDraw sets mCurDimensions from the window; size the eye targets to match.
     const double t0 = NowMs();
+    const bool menuOpen = PortMenuOpen(gui.get());
+    UpdateVrInputBlock(menuOpen);
+    // Feed the VR controllers to ImGui before the frame is built. The gamepad
+    // navigation CVar is forced on for this frame only, then restored, so the
+    // desktop setting is untouched (and the menu UI still agrees with the value
+    // it was drawn with).
+    InjectVrImGuiInput(menuOpen);
+    const int navOriginal = CVarGetInteger(kCvarControlNav, 0);
+    if (menuOpen) {
+        CVarSetInteger(kCvarControlNav, 1);
+    }
     gui->StartDraw();
+    CVarSetInteger(kCvarControlNav, navOriginal);
     EnsureRenderTargets(g_ctx, interp);
     PrepareOffscreen(interp);
     const double tPrep = NowMs();
@@ -2216,8 +2446,8 @@ bool RenderGameFrame(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtxRep
     const double tEye0 = NowMs();
 
     // Our blitter leaves an intermediate texture bound; ImGui's DX11 backend does
-    // not set its own render target, so rebind the backbuffer before the GUI draw.
-    interp->GetCurrentRenderingAPI()->StartDrawToFramebuffer(0, 1.0f);
+    // not set its own render target, so the target must be bound explicitly.
+    auto* rapi = interp->GetCurrentRenderingAPI();
 
     if (!g_ctx->loggedFirstContent) {
         g_ctx->loggedFirstContent = true;
@@ -2227,7 +2457,41 @@ bool RenderGameFrame(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtxRep
 
     // Present the desktop mirror (once per game frame; the headset is fed
     // separately by PresentFrame at the display rate).
-    gui->EndDraw();
+    if (menuOpen) {
+        const ImGuiIO& io = ImGui::GetIO();
+        const uint32_t winW = (uint32_t)std::max(2.0f, io.DisplaySize.x);
+        const uint32_t winH = (uint32_t)std::max(2.0f, io.DisplaySize.y);
+        if (g_ctx->EnsureMenuTexture(winW, winH)) {
+            // Render only the ImGui overlay (not the game image) into the
+            // offscreen texture. Clearing the game framebuffer pointer makes
+            // Fast3dGui::DrawGame skip its ImGui::Image; the game itself is
+            // already in the eye textures, so this keeps stereo intact.
+            const float clear[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+            g_ctx->DeviceContext()->ClearRenderTargetView(g_ctx->menuRtv.Get(), clear);
+            ID3D11RenderTargetView* mrtv = g_ctx->menuRtv.Get();
+            g_ctx->DeviceContext()->OMSetRenderTargets(1, &mrtv, nullptr);
+            const uintptr_t savedFb = interp->mGfxFrameBuffer;
+            interp->mGfxFrameBuffer = 0;
+            gui->EndDraw();
+            interp->mGfxFrameBuffer = savedFb;
+
+            // Composite the menu over both stereo eye textures for the headset.
+            g_ctx->CompositeUiToEyes();
+
+            // Desktop mirror: the menu over black (the game returns when the
+            // menu is closed). The same draw data is still valid after EndDraw.
+            rapi->StartDrawToFramebuffer(0, 1.0f);
+            rapi->ClearFramebuffer(true, true);
+            ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+        } else {
+            // Fallback: no offscreen texture, so the menu only shows on the desktop.
+            rapi->StartDrawToFramebuffer(0, 1.0f);
+            gui->EndDraw();
+        }
+    } else {
+        rapi->StartDrawToFramebuffer(0, 1.0f);
+        gui->EndDraw();
+    }
     const double tGui = NowMs();
     // The desktop window mirrors the left eye. It is only a spectator view, so
     // present it every Nth game frame: default 2 (~30 Hz mirror) so the desktop
@@ -2238,7 +2502,6 @@ bool RenderGameFrame(Gfx* commands, const std::unordered_map<Mtx*, MtxF>& mtxRep
     // avoid Interpreter::EndFrame here: its frame-rate limiter and frame-latency
     // wait would stall this thread, which also drives the game tick and the
     // headset pump, dropping the game framerate while the headset stays smooth.
-    auto* rapi = interp->GetCurrentRenderingAPI();
     rapi->EndFrame();
     rapi->FinishRender();
 
