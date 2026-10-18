@@ -96,6 +96,7 @@ using Microsoft::WRL::ComPtr;
 constexpr uint32_t kEyeRenderWidth = 1280; // per-eye render width; height from aspect
 constexpr float kDefaultScreenSize = 1.6f; // metres, width
 constexpr float kDefaultScreenDistance = 2.0f;
+constexpr float kDefaultScreenVerticalOffset = 0.0f;
 constexpr float kDefaultStereoStrength = 3.0f; // full IPD in game world units
 constexpr float kMaxEyeRenderWidth = 1280.0f;  // per-eye render width cap
 constexpr float kScreenSizeStep = 0.1f;
@@ -376,6 +377,10 @@ Context* g_ctx = nullptr;
 bool g_enabled = true;
 float g_screenWidth = kDefaultScreenSize; // metres
 float g_screenDistance = kDefaultScreenDistance;
+// Vertical offset from the anchor/eye line, in metres. Positive moves the screen up.
+float g_screenVerticalOffset = kDefaultScreenVerticalOffset;
+// When true the screen yaws every frame so its face always points at the viewer.
+bool g_facePlayer = true;
 float g_stereoStrength = kDefaultStereoStrength;
 // User trim (NDC) added to the auto zero-parallax shift. Fixed at 0: the menu
 // control was removed, so the zero-parallax plane stays on the camera target.
@@ -1699,7 +1704,7 @@ bool TryRecenter() {
     g_ctx->screenDir = { hx, 0.0f, hz };
     XrPosef pose{};
     pose.position.x = loc.pose.position.x + hx * dist;
-    pose.position.y = loc.pose.position.y;
+    pose.position.y = loc.pose.position.y + g_screenVerticalOffset;
     pose.position.z = loc.pose.position.z + hz * dist;
     pose.orientation = YawQuat(std::atan2(-hx, -hz));
     g_ctx->screenPose = pose;
@@ -1718,6 +1723,8 @@ bool TryRecenter() {
 constexpr const char* kCvarEnabled = "gVR.Enabled";
 constexpr const char* kCvarScreenSize = "gVR.ScreenSize";
 constexpr const char* kCvarScreenDistance = "gVR.ScreenDistance";
+constexpr const char* kCvarScreenVerticalOffset = "gVR.ScreenVerticalOffset";
+constexpr const char* kCvarFacePlayer = "gVR.FacePlayer";
 constexpr const char* kCvarStereoStrength = "gVR.StereoStrength";
 constexpr const char* kCvarBackgroundParallax = "gVR.BackgroundParallax";
 
@@ -1760,10 +1767,13 @@ void LoadSettings() {
     g_enabled = CVarGetInteger(kCvarEnabled, 1) != 0;
     g_screenWidth = CvarFloat(kCvarScreenSize, kDefaultScreenSize);
     g_screenDistance = CvarFloat(kCvarScreenDistance, kDefaultScreenDistance);
+    g_screenVerticalOffset = std::clamp(CvarFloat(kCvarScreenVerticalOffset, kDefaultScreenVerticalOffset), -5.0f, 5.0f);
+    g_facePlayer = CVarGetInteger(kCvarFacePlayer, 1) != 0;
     g_stereoStrength = CvarFloat(kCvarStereoStrength, kDefaultStereoStrength);
     g_bgParallaxPx = (int)CvarFloat(kCvarBackgroundParallax, 2.0f);
-    SPDLOG_INFO("[VR] Settings loaded: enabled={} screenSize={:.2f}m distance={:.2f}m stereo={:.2f}", g_enabled,
-                g_screenWidth, g_screenDistance, g_stereoStrength);
+    SPDLOG_INFO("[VR] Settings loaded: enabled={} screenSize={:.2f}m distance={:.2f}m offset={:.2f}m facePlayer={} "
+                "stereo={:.2f}",
+                g_enabled, g_screenWidth, g_screenDistance, g_screenVerticalOffset, g_facePlayer, g_stereoStrength);
 }
 
 // Pushes the loaded settings into the live session (screen size + distance).
@@ -1774,6 +1784,7 @@ void ApplySettingsToContext() {
     const float aspect = g_ctx->renderWidth > 0 ? (float)g_ctx->renderHeight / (float)g_ctx->renderWidth : 0.75f;
     g_ctx->screenSize.width = g_screenWidth;
     g_ctx->screenSize.height = g_screenWidth * aspect;
+    g_ctx->screenPose.position.y = g_screenVerticalOffset;
     g_ctx->screenPose.position.z = -g_screenDistance;
 }
 
@@ -1969,8 +1980,32 @@ void ApplyDistance() {
     }
     const float d = g_screenDistance;
     g_ctx->screenPose.position.x = g_ctx->screenAnchor.x + g_ctx->screenDir.x * d;
-    g_ctx->screenPose.position.y = g_ctx->screenAnchor.y + g_ctx->screenDir.y * d;
+    g_ctx->screenPose.position.y = g_ctx->screenAnchor.y + g_ctx->screenDir.y * d + g_screenVerticalOffset;
     g_ctx->screenPose.position.z = g_ctx->screenAnchor.z + g_ctx->screenDir.z * d;
+}
+
+// Keeps the quad yawed toward the viewer when "face player" is enabled. The
+// screen stays world-locked at the anchor (only its orientation changes), so the
+// distance/size controls keep behaving exactly as before.
+void UpdateScreenPose() {
+    if (!g_facePlayer || g_ctx == nullptr || !g_ctx->initialized || g_ctx->viewSpace == XR_NULL_HANDLE) {
+        return;
+    }
+    XrSpaceLocation loc{ XR_TYPE_SPACE_LOCATION };
+    if (XR_FAILED(xrLocateSpace(g_ctx->viewSpace, g_ctx->localSpace, g_ctx->frameState.predictedDisplayTime, &loc)) ||
+        !(loc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT) ||
+        !(loc.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT)) {
+        return;
+    }
+    const float dx = g_ctx->screenPose.position.x - loc.pose.position.x;
+    const float dz = g_ctx->screenPose.position.z - loc.pose.position.z;
+    const float len = std::sqrt(dx * dx + dz * dz);
+    if (len < 1e-4f) {
+        return;
+    }
+    const float hx = dx / len;
+    const float hz = dz / len;
+    g_ctx->screenPose.orientation = YawQuat(std::atan2(-hx, -hz));
 }
 
 void SetScreenDistance(float metres) {
@@ -1991,17 +2026,22 @@ void ReloadSettings() {
     const bool enabled = CVarGetInteger(kCvarEnabled, 1) != 0;
     const float size = CvarFloat(kCvarScreenSize, kDefaultScreenSize);
     const float dist = CvarFloat(kCvarScreenDistance, kDefaultScreenDistance);
+    const float vertical = CvarFloat(kCvarScreenVerticalOffset, kDefaultScreenVerticalOffset);
+    const bool facePlayer = CVarGetInteger(kCvarFacePlayer, 1) != 0;
     const float stereo = CvarFloat(kCvarStereoStrength, kDefaultStereoStrength);
     const int bgParallax = (int)CvarFloat(kCvarBackgroundParallax, 2.0f);
     // The settings menu fires its callback every frame, so only apply (and log)
     // when something actually changed.
-    if (enabled == g_enabled && size == g_screenWidth && dist == g_screenDistance && stereo == g_stereoStrength &&
+    if (enabled == g_enabled && size == g_screenWidth && dist == g_screenDistance &&
+        vertical == g_screenVerticalOffset && facePlayer == g_facePlayer && stereo == g_stereoStrength &&
         bgParallax == g_bgParallaxPx) {
         return;
     }
     g_enabled = enabled;
     g_screenWidth = size;
     g_screenDistance = dist;
+    g_screenVerticalOffset = std::clamp(vertical, -5.0f, 5.0f);
+    g_facePlayer = facePlayer;
     g_stereoStrength = stereo;
     g_bgParallaxPx = std::clamp(bgParallax, 0, 64);
     if (g_ctx != nullptr) {
@@ -2010,8 +2050,8 @@ void ReloadSettings() {
         g_ctx->screenSize.height = g_screenWidth * aspect;
         ApplyDistance();
     }
-    SPDLOG_INFO("[VR] ReloadSettings: enabled={} size={:.2f} dist={:.2f} stereo={:.2f}", g_enabled, g_screenWidth,
-                g_screenDistance, g_stereoStrength);
+    SPDLOG_INFO("[VR] ReloadSettings: enabled={} size={:.2f} dist={:.2f} offset={:.2f} facePlayer={} stereo={:.2f}",
+                g_enabled, g_screenWidth, g_screenDistance, g_screenVerticalOffset, g_facePlayer, g_stereoStrength);
 }
 
 float GetStereoStrength() {
@@ -2258,6 +2298,8 @@ void PresentFrame() {
         return;
     }
     const double t1 = NowMs();
+
+    UpdateScreenPose();
 
     static int s_lastShould = -1;
     if ((int)g_ctx->frameState.shouldRender != s_lastShould) {

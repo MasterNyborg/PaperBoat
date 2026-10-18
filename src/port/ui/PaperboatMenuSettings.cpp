@@ -543,6 +543,28 @@ void PaperboatMenu::AddMenuSettings() {
                 .Max(15.0f)
                 .DefaultValue(2.0f)
         );
+    AddWidget(path, "Screen Vertical Offset (m)", WIDGET_CVAR_SLIDER_FLOAT)
+        .CVar("gVR.ScreenVerticalOffset")
+        .RaceDisable(false)
+        .Callback([](WidgetInfo&) { Paperboat::VR::ReloadSettings(); })
+        .Options(
+            FloatSliderOptions()
+                .Tooltip("Raises or lowers the screen, in metres. Positive values move it up.")
+                .Format("%.2f")
+                .Step(0.05f)
+                .Min(-2.0f)
+                .Max(2.0f)
+                .DefaultValue(0.0f)
+        );
+    AddWidget(path, "Always Face Player", WIDGET_CVAR_CHECKBOX)
+        .CVar("gVR.FacePlayer")
+        .RaceDisable(false)
+        .Callback([](WidgetInfo&) { Paperboat::VR::ReloadSettings(); })
+        .Options(
+            CheckboxOptions()
+                .DefaultValue(true)
+                .Tooltip("Rotates the screen so it always faces you as you move around.")
+        );
     AddWidget(path, "3D Strength", WIDGET_CVAR_SLIDER_FLOAT)
         .CVar("gVR.StereoStrength")
         .RaceDisable(false)
